@@ -1,0 +1,48 @@
+# This is the sample uEnv.txt file for qemu-virt U-boot
+
+# kernel command line can be modified here
+bootargs=orion -panic_regs -panic_mmap
+
+# When bootelf kernel, do not directly jump into kernel, bootelf is only used
+# to properly load orion in elf format.
+# After bootelf, we use a 'bootm go' to jump into kernel, because boom can
+# pass the device tree pointer and boothart accurately to kernel.
+autostart=0
+
+# no need to relocate initrd
+initrd_high=ffffffffffffffff
+
+# The FIT file to boot from
+fitfile=image.fit
+
+# kerneladdr must match what's in FIT
+# Note: loading kernel is divided into two steps
+# 1. The bootm loados command loads the kernel into kerneladdr(0x80a00000 which
+#       is defined in fit-image.its)
+# 2. The bootelf -p command loads the kernel into 0x80200000(the
+#      load address defined by the elf header)
+kerneladdr=@KERNEL_LOAD@
+
+# use FDT that came with uboot
+setupfdt1=setexpr newfdt @KERNEL_LOAD@ + 0x800000;fdt move ${fdtaddr} ${newfdt}; fdt addr ${newfdt}; fdt resize 4096
+
+# set fdt initrd
+setupird=fdt set /chosen linux,initrd-start <0x0 0x${initrd_start}>; fdt set /chosen linux,initrd-end <0x0 0x${initrd_end}>
+
+# set fdt simple-framebuffer
+setupfb=setexpr simplefb_addr @KERNEL_LOAD@ + 0x900000; fdt mknode / simplefb; fdt set /simplefb compatible "simple-framebuffer"; fdt set /simplefb width <0x280>; fdt set /simplefb height <0x1e0>; fdt set /simplefb stride <0x780>; fdt set /simplefb format "r8g8b8"; fdt set /simplefb reg <0x0 0x${simplefb_addr} 0x0 0x0>
+
+# set fdt bootargs
+setupfdt2=fdt set /chosen bootargs "${bootargs}"
+
+# load fit image from fatpart
+loadfit=setexpr fatpart ${distro_bootpart} + 1;fatload ${devtype} ${devnum}:${fatpart} ${loadaddr} ${prefix}${fitfile}
+
+# load kernel and initrd into ram
+loadkernel=bootm start ${loadaddr} ${loadaddr} ${newfdt}; bootm loados ${loadaddr} ${loadaddr} ${newfdt}; bootm ramdisk ${loadaddr} ${loadaddr} ${newfdt}; bootelf -p ${kerneladdr};
+
+# just for debug
+message=echo Booting kernel with ramdisk ${initrd_start}-${initrd_end}
+
+# the real boot command be executed
+boot2=run loadfit; run setupfdt1; run setupfdt2; run setupfb; run loadkernel; run setupird; run message; bootm go ${loadaddr} - ${newfdt};

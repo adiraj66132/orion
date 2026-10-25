@@ -1,0 +1,311 @@
+# SPDX-License-Identifier: BSD-2-Clause
+cmake_minimum_required(VERSION 3.22)
+
+# Orion builds every compile flag explicitly below, so wipe CMake's
+# built-in per-config defaults (e.g. CMAKE_C_FLAGS_RELWITHDEBINFO is
+# "-O2 -g -DNDEBUG"). The root CMakeLists already does this for the
+# main project, but sub-projects (the kernel, gtests) include this
+# file directly and would otherwise inherit those defaults -- notably
+# RelWithDebInfo's -DNDEBUG, which would drop ASSERTs whatever
+# DEBUG_CHECKS says. Only the per-config vars are reset; the base
+# CMAKE_C_FLAGS carries the toolchain's arch flags and must survive.
+foreach(_cfg DEBUG MINSIZEREL RELWITHDEBINFO RELEASE)
+   set(CMAKE_C_FLAGS_${_cfg} "")
+   set(CMAKE_CXX_FLAGS_${_cfg} "")
+endforeach()
+
+set(GENERAL_DEFS_LIST "")
+
+if (CMAKE_BUILD_TYPE STREQUAL "Release")
+
+   message(STATUS "Preparing a RELEASE build...")
+   list(APPEND GENERAL_DEFS_LIST "-DNDEBUG -DTILCK_RELEASE_BUILD")
+   set(OPT_FLAGS_LIST -O3)
+
+elseif (CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
+
+   message(STATUS "Preparing a MinSizeRel build...")
+   list(APPEND GENERAL_DEFS_LIST "-DNDEBUG -DTILCK_RELEASE_BUILD")
+   set(OPT_FLAGS_LIST -Os)
+
+elseif (CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+
+   message(STATUS "Preparing a RelWithDebInfo build...")
+   list(APPEND GENERAL_DEFS_LIST "-DTILCK_RELEASE_BUILD")
+   set(OPT_FLAGS_LIST -O2)
+
+   # Optimized like a release build but still meant for debugging, so keep
+   # ASSERTs unless DEBUG_CHECKS is off (same NDEBUG lockstep as the Debug
+   # branch below; -ggdb is on for every build type, see DBG_FLAGS_LIST).
+   if (NOT DEBUG_CHECKS)
+      list(APPEND GENERAL_DEFS_LIST "-DNDEBUG")
+   endif()
+
+elseif (CMAKE_BUILD_TYPE STREQUAL "Debug")
+
+   message(STATUS "Preparing a DEBUG build...")
+   list(APPEND GENERAL_DEFS_LIST "-DTILCK_DEBUG_BUILD")
+   set(OPT_FLAGS_LIST -O0 -fno-inline-functions)
+
+   # ASSERT() and DEBUG_ONLY() are gated on NDEBUG, but their bodies reference
+   # symbols declared under #if DEBUG_CHECKS. A DEBUG_CHECKS=0 build removes
+   # those symbols, so define NDEBUG too and drop the macros in lockstep.
+   if (NOT DEBUG_CHECKS)
+      list(APPEND GENERAL_DEFS_LIST "-DNDEBUG")
+   endif()
+
+else()
+
+   message(FATAL_ERROR "Unknown build type: '${CMAKE_BUILD_TYPE}'")
+
+endif()
+
+if (TEST_GCOV OR KERNEL_GCOV)
+   if (NOT EXISTS ${LCOV_DIR})
+      show_missing_lcov_error()
+   endif()
+endif()
+
+if (TEST_GCOV)
+   #
+   # --coverage is the documented "do coverage" flag understood by
+   # both gcc and clang. At compile time it implies
+   # `-fprofile-arcs -ftest-coverage`; at link time it implies the
+   # right runtime library for the compiler driver in use -- gcc
+   # pulls in libgcov.a, darwin clang pulls in
+   # libclang_rt.profile_osx.a, linux clang pulls in the
+   # equivalent compiler-rt library. The previous hardcoded
+   # `-lgcov` only worked when libgcov happened to be on the link
+   # search path (e.g. Linux hosts with a system gcc) and broke on
+   # darwin clang, which doesn't ship a library named "gcov" at
+   # all.
+   #
+   set(GCOV_COMPILE_FLAGS "--coverage")
+   set(GCOV_LINK_FLAGS "--coverage")
+endif()
+
+set(
+   DBG_FLAGS_LIST
+
+   -ggdb
+   -fno-omit-frame-pointer
+)
+
+set(
+   WARN_FLAGS_LIST
+
+   -Wall
+   -Wextra
+   -Werror
+   -Wshadow
+   -Wvla
+   -Wcast-align
+   -Wno-unused-function
+   -Wno-unused-parameter
+   -Wno-unused-label
+)
+
+if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
+
+   if (WCONV)
+      show_wconv_warning()
+   endif()
+
+elseif (CMAKE_C_COMPILER_ID STREQUAL "Clang")
+
+   list(APPEND WARN_FLAGS_LIST "-Wno-missing-braces")
+
+   if (NOT KERNEL_SYSCC)
+      if (WCONV)
+         show_wconv_warning()
+      endif()
+   endif()
+
+endif()
+
+set(
+   FREESTANDING_FLAGS_LIST
+
+   -ffreestanding
+   -fno-builtin
+)
+JOIN("${FREESTANDING_FLAGS_LIST}" ${SPACE} FREESTANDING_FLAGS)
+
+set(
+   SAFER_BEHAVIOR_FLAGS_LIST
+
+   -fno-strict-aliasing
+   -fwrapv
+   -Wundef
+)
+JOIN("${SAFER_BEHAVIOR_FLAGS_LIST}" ${SPACE} SAFER_BEHAVIOR_FLAGS)
+
+JOIN("${GENERAL_DEFS_LIST}"       ${SPACE} GENERAL_DEFS)
+JOIN("${DBG_FLAGS_LIST}"          ${SPACE} DBG_FLAGS)
+JOIN("${OPT_FLAGS_LIST}"          ${SPACE} OPT_FLAGS)
+JOIN("${WARN_FLAGS_LIST}"         ${SPACE} WARN_FLAGS)
+set(COMMON_FLAGS "${GENERAL_DEFS} ${DBG_FLAGS} ${OPT_FLAGS} ${WARN_FLAGS}")
+
+# Kernel flags
+
+set(GENERAL_KERNEL_FLAGS_LIST "")
+
+list(
+   APPEND GENERAL_KERNEL_FLAGS_LIST
+
+   -D__TILCK_KERNEL__
+
+   ${FREESTANDING_FLAGS_LIST}
+   ${SAFER_BEHAVIOR_FLAGS_LIST}
+)
+
+if (KERNEL_SYSCC)
+   if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
+
+      #
+      # Unfortunately, when FORTIFY_SOURCE is enabled, new GCC compilers like
+      # 9.x require the libc to implement extra functions and, apparently, they
+      # don't care about -ffreestanding, nor care to put those functions in
+      # libgcc, which Orion links, statically.
+      #
+      # Therefore, in SYSCC builds, we fail with:
+      #
+      #     select.c:126: undefined reference to `__fdelt_chk'
+      #
+      # For the moment, it's OK to just disable those extra checks.
+      # TODO: consider enabling _FORTIFY_SOURCE in Orion.
+      #
+
+      list(
+         APPEND GENERAL_KERNEL_FLAGS_LIST
+         -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
+      )
+
+   endif()
+endif()
+
+if (WCONV)
+   list(APPEND GENERAL_KERNEL_FLAGS_LIST "-Wconversion")
+endif()
+
+if (KERNEL_UBSAN)
+
+   list(
+      APPEND GENERAL_KERNEL_FLAGS_LIST
+
+      -fsanitize=integer-divide-by-zero
+      -fsanitize=nonnull-attribute,returns-nonnull-attribute
+      -fsanitize=bool,enum
+      -fsanitize=unreachable
+      -fsanitize=null
+      -fsanitize=shift-exponent
+      -fsanitize=shift-base
+   )
+
+   #
+   # Cannot enable -fsanitize=alignment, with Clang because it generates leaf
+   # functions which misalign the stack pointer. What happens when get an IRQ
+   # while running one of those functions? If UBSAN is enabled, we'll get
+   # panic, otherwise everything is fine, because x86 allows unaligned access.
+   #
+   # See:
+   #  - https://bugs.llvm.org/show_bug.cgi?id=49828
+   #  - https://forum.osdev.org/viewtopic.php?f=13&t=42430&start=0
+   #
+
+   if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
+
+      list(
+         APPEND GENERAL_KERNEL_FLAGS_LIST
+
+         -fsanitize=alignment
+         -fsanitize-recover=alignment
+      )
+
+   endif()
+
+endif()
+
+JOIN("${GENERAL_KERNEL_FLAGS_LIST}" ${SPACE} GENERAL_KERNEL_FLAGS)
+set(KERNEL_FLAGS "${COMMON_FLAGS} ${GENERAL_KERNEL_FLAGS}")
+
+set(
+   KERNEL_NO_ARCH_FLAGS_LIST
+
+   -DKERNEL_TEST
+   -fPIC
+   ${KERNEL_FLAGS}
+   ${GCOV_COMPILE_FLAGS}
+)
+
+JOIN("${KERNEL_NO_ARCH_FLAGS_LIST}" ${SPACE} KERNEL_NO_ARCH_FLAGS)
+
+set(
+   KERNEL_CXX_FLAGS_LIST
+
+   -fno-exceptions
+   -fno-use-cxa-atexit
+   -fno-rtti
+)
+
+JOIN("${KERNEL_CXX_FLAGS_LIST}" ${SPACE} KERNEL_CXX_FLAGS)
+
+set(
+   LOWLEVEL_BINARIES_FLAGS_LIST
+
+   -fno-common
+   -fno-exceptions
+   -fno-stack-protector
+   -fno-asynchronous-unwind-tables
+   -mno-red-zone
+
+   # Allow easier disassembly debugging
+   # -mpush-args
+   # -mno-accumulate-outgoing-args
+   # -mno-stack-arg-probe
+)
+JOIN("${LOWLEVEL_BINARIES_FLAGS_LIST}" ${SPACE} LOWLEVEL_BINARIES_FLAGS)
+
+
+#
+# On x86, -mgeneral-regs-only is supported only by GCC >= 7.0.
+# Clang supports it only on Aarch64 and the patch for making it generic
+# has been abandoned: https://reviews.llvm.org/D38479
+#
+set(MGENERAL_REGS_ONLY_SUPPORTED OFF)
+
+if (KERNEL_SYSCC)
+
+   # Special case: we're using not using our custom toolchain compiler
+   if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
+      set(MGENERAL_REGS_ONLY_SUPPORTED ON)
+   endif()
+
+else()
+
+   # DEFAULT CASE: we're using a GCC compiler from our toolchain
+   set(MGENERAL_REGS_ONLY_SUPPORTED ON)
+
+endif()
+
+# Disable the generation of any kind of FPU instructions
+if (${MGENERAL_REGS_ONLY_SUPPORTED})
+
+   list(APPEND DISABLE_FPU_FLAGS_LIST -mgeneral-regs-only)
+
+else()
+
+   list(
+      APPEND DISABLE_FPU_FLAGS_LIST
+
+      -mno-80387
+      -mno-mmx
+      -mno-3dnow
+      -mno-sse
+      -mno-sse2
+      -mno-avx
+   )
+
+endif()
+
+JOIN("${DISABLE_FPU_FLAGS_LIST}" ${SPACE} DISABLE_FPU_FLAGS)

@@ -1,0 +1,62 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
+#pragma once
+#include <tilck/common/basic_defs.h>
+#include <tilck/kernel/hal_types.h>
+
+static inline bool user_out_of_range(const void *user_ptr, size_t n)
+{
+   return !user_ptr || ((ulong)user_ptr + n) > BASE_VA;
+}
+
+/*
+ * Copy between user and kernel memory. Return 0 on success, otherwise a
+ * negative errno ready to be returned to user space: -EFAULT for a bad user
+ * pointer, and -ENOMEM from copy_to_user() when servicing a copy-on-write page
+ * mid-copy runs out of memory. Callers should propagate the result rather than
+ * coarsen it back to -EFAULT.
+ */
+int copy_from_user(void *dest, const void *user_ptr, size_t n);
+int copy_to_user(void *user_ptr, const void *src, size_t n);
+
+/*
+ * Low-level byte copy used by copy_{to,from}_user(). Defined per-arch in asm
+ * (kernel/arch/<arch>/user_copy.S). The caller arms the current task's
+ * user_access_fixup landing pad around the call; if any access faults on a
+ * user page, the fault handler resumes execution at asm_user_copy_fault, which
+ * makes this return 1. Returns 0 when the whole copy succeeds.
+ */
+int arch_user_copy(void *dest, const void *src, size_t n);
+
+int copy_str_from_user(void *dest,
+                       const void *user_ptr,
+                       size_t max_size,
+                       size_t *written_ptr);
+
+int copy_str_array_from_user(void *dest,
+                             const char *const *argv,
+                             size_t max_size,
+                             size_t *written_ptr);
+
+int duplicate_user_path(char *dest,
+                        const char *user_path,
+                        size_t dest_size,
+                        size_t *written_ptr /* IN/OUT */);
+
+int duplicate_user_argv(char *dest,
+                        const char *const *user_argv,
+                        size_t dest_size,
+                        size_t *written_ptr /* IN/OUT */);
+
+
+int
+push_args_on_user_stack(regs_t *r,
+                        const char *const *argv,
+                        u32 argc,
+                        const char *const *env,
+                        u32 envc);
+
+void push_on_stack(ulong **stack_ptr_ref, ulong val);
+void push_on_stack2(pdir_t *pdir, ulong **stack_ptr_ref, ulong val);
+void push_on_user_stack(regs_t *r, ulong val);
+void push_string_on_user_stack(regs_t *r, const char *str);

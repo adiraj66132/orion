@@ -1,0 +1,471 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: BSD-2-Clause
+
+# RUBY CONF
+#
+# 3.2 on purpose: it is what Ubuntu 24.04 ships, and the package
+# manager is meant to run on that system's Ruby rather than download
+# its own. A gem a distro left out (minitest, for the tests) is
+# installed by ensure_ruby_gems; the package manager itself needs
+# nothing beyond the standard library. The floor is the interpreter;
+# the gems are a separate list.
+RUBY_MIN_VER='3.2'
+
+# Project's root directory
+SOURCE_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+MAIN_DIR="$(cd "$SOURCE_DIR/.." && pwd)"
+OS="$(uname -s)"
+
+if ! [ "$QUIET" = 1 ]; then
+   echo
+   echo "Bash bootstrap"
+   echo "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+fi
+
+if [[ "$MAIN_DIR" == *" "* ]]; then
+   echo "The Orion source must be checked out in a path *WITHOUT* spaces"
+   echo "Current path: '$MAIN_DIR'"
+   exit 1
+fi
+
+# Force a UTF-8 locale. Minimal Docker images (e.g. ubuntu:24.04) ship with
+# LANG unset, which makes Ruby default to US-ASCII and File.read/gsub fail
+# on any byte > 0x7F in files like ncurses' `configure`.
+if [[ "$LANG" == "" || "$LANG" == "C" || "$LANG" == "POSIX" ]]; then
+   export LANG=C.UTF-8
+fi
+if [[ "$LC_ALL" == "C" || "$LC_ALL" == "POSIX" ]]; then
+   export LC_ALL=C.UTF-8
+fi
+
+if [[ "$OS" == "FreeBSD" || "$OS" == "Darwin" ]]; then
+   # Prepend our gnu-wrap directory to the path, so that on systems with a
+   # BSD userland (FreeBSD, macOS) we'll use the GNU tools instead of the
+   # BSD ones. Required for at least u-boot, which uses GNU make 3.82+
+   # features (`undefine`) and the system /usr/bin/make on macOS is 3.81.
+   export PATH="$MAIN_DIR/scripts/gnu-wrap:$PATH"
+fi
+
+# Source files to include
+source $MAIN_DIR/scripts/bash_includes/script_utils
+source $MAIN_DIR/scripts/bash_includes/install_pkgs
+source $MAIN_DIR/other/pkg_versions
+source $MAIN_DIR/other/host_pkg_versions
+source $MAIN_DIR/other/toolchain_conf
+
+function check_ruby_ver {
+
+   local req_major=$(cut -d '.' -f 1 <<< $RUBY_MIN_VER)
+   local req_minor=$(cut -d '.' -f 2 <<< $RUBY_MIN_VER)
+
+   if [[ "$req_major" == "" || "$req_minor" == "" ]]; then
+      echo "ERROR: failed to parse RUBY_MIN_VER: $RUBY_MIN_VER"
+      exit 1
+   fi
+
+   if [[ "$RUBY" == "" ]]; then
+      return 1 # Variable not set
+   fi
+
+   if ! [[ -f "$RUBY" ]]; then
+      return 2 # File not found
+   fi
+
+   local ver="$($RUBY --version)"
+
+   if [[ "$ver" == "" ]]; then
+      return 3 # Cannot run the binary
+   fi
+
+   if [[ "$ver" =~ ruby\ ([0-9]+)[.]([0-9]+)[.].+ ]]; then
+
+      local major=${BASH_REMATCH[1]}
+      local minor=${BASH_REMATCH[2]}
+
+      if [[ "$major" == "" || "$minor" == "" ]]; then
+         echo "ERROR: failed to parse ruby version from: $ver"
+         return 4 # Version parsing failed.
+      fi
+
+      if [[ $major -ge $((req_major+1)) ]]; then
+         return 0 # Success
+      fi
+
+      if [[ $major -eq $req_major && $minor -ge $req_minor ]]; then
+         return 0 # Success
+      fi
+   fi
+
+   return 5 # Version check failed.
+}
+
+function check_new_ruby_binary {
+
+   check_ruby_ver
+   status=$?
+
+   case $status in
+      0) return;;
+      1) echo "ERROR: \$RUBY is not set"; exit 1;;
+      2) echo "ERROR: File not found: $RUBY"; exit 1;;
+      3) echo "ERROR: Cannot run $RUBY"; exit 1;;
+      4) echo "ERROR: Cannot parse version of $RUBY"; exit 1;;
+      5) echo "ERROR: Version check failed for $RUBY"; exit 1;;
+      *) echo "ERROR: Unknown error $status. RUBY=$RUBY"; exit 1;;
+   esac
+}
+
+# $1 -> distro
+# $2 -> ver
+function download_ruby {
+
+   local distro="$1"
+   local ver="$2"
+   local compdir=$RUBY_INSTALL_DIR
+   local gh="https://github.com/vvaltchev/ruby/releases/download"
+   local ruby_ver_=$(tr '.' '_' <<< $HOST_VER_RUBY)
+   local url="$gh/v${ruby_ver_}"
+   local tarname="ruby-${HOST_VER_RUBY}-${distro}${ver}-${HOST_ARCH}.tar.bz2"
+
+   if [[ "$FORCE_RUBY_BUILD" == 1 ]]; then
+      echo "INFO: FORCE_RUBY_BUILD=1, skip download attempt"
+      return
+   fi
+
+   if ! wget --spider "$url/$tarname" &>/dev/null; then
+      echo "INFO: No pre-compiled $tarname package available"
+      return
+   fi
+
+   mkdir -p $compdir/..
+   pushd $compdir/..
+   download_file_in_cache "$url" "$tarname"
+   extract_cachefile_tar_bz $tarname ruby-$HOST_VER_RUBY $HOST_VER_RUBY
+   popd
+
+   RUBY=$compdir/bin/ruby
+   check_new_ruby_binary
+   echo "INFO: Download Ruby: DONE"
+}
+
+function build_ruby {
+
+   local installdir=$RUBY_INSTALL_DIR
+   local compdir=$installdir/source
+   local major=$(cut -d '.' -f 1 <<< $HOST_VER_RUBY)
+   local minor=$(cut -d '.' -f 2 <<< $HOST_VER_RUBY)
+   local url="https://cache.ruby-lang.org/pub/ruby/${major}.${minor}"
+   local tarname="ruby-${HOST_VER_RUBY}.tar.gz"
+   local params=()
+
+   echo "INFO: Build Ruby $HOST_VER_RUBY from source"
+
+   if [[ "$SKIP_INSTALL_PACKAGES" != "1" ]]; then
+      # Do check/install all the system dependencies.
+      install_packages
+   fi
+
+   # Now finally create/enter in the ruby directory and download the source.
+   mkdir -p $compdir/..
+   pushd $compdir/..
+
+   download_file_in_cache "$url" "$tarname"
+   extract_cachefile_tar_gz $tarname ruby-$HOST_VER_RUBY source
+
+   # Enter in ruby/$HOST_VER_RUBY and build.
+   cd $compdir
+   params+=(--prefix='$installdir')
+   params+=(--disable-install-doc)
+   params+=(--enable-load-relative)
+   params+=(--with-out-ext='-test-*,win32*')
+   run_command2 "./configure ${params[*]}" configure.log
+   run_command2 "make -j$BUILD_PAR" build.log
+   run_command2 "make install" install.log
+   popd
+
+   RUBY="$installdir/bin/ruby"
+   check_new_ruby_binary
+   echo "INFO: Build Ruby: DONE"
+}
+
+function setup_ruby {
+
+   local compdir=$RUBY_INSTALL_DIR
+   local os_rel="/etc/os-release"
+   local major
+   local minor
+   local ver
+
+   # Check Ruby's version.
+   if [[ "$RUBY" != "" && -f "$RUBY" ]]; then
+      echo "INFO: Using ruby from the env var (unconditionally)."
+      return
+   fi
+
+   if [ -f "$compdir/bin/ruby" ]; then
+      RUBY="$compdir/bin/ruby"
+      if ! [ "$QUIET" = 1 ]; then
+         echo "INFO: Using local Ruby:"
+         echo "$RUBY"
+      fi
+      return
+   fi
+
+   RUBY="$(which ruby)"
+
+   if check_ruby_ver; then
+      if ! [ "$QUIET" = 1 ]; then
+         echo "INFO: using system Ruby: $RUBY"
+      fi
+
+      if [[ "$OS" == "FreeBSD" ]]; then
+         # On FreeBSD, we need to run `install_packages` even if we found
+         # a recent-enough version of Ruby installed, simply because on that
+         # OS, Ruby doesn't ship with many of the standard gems included on
+         # Linux. Those are available as separate packages, so we need to
+         # check for their presence and install them as necessary. The good
+         # news is that FreeBSD's package manager is super-fast, so that takes
+         # a few hundred milliseconds (e.g. ~300ms) on a modern machine.
+         if [[ "$SKIP_INSTALL_PACKAGES" != "1" ]]; then
+            install_packages
+            export SKIP_INSTALL_PACKAGES=1
+         fi
+      fi
+
+      # A system Ruby new enough to use may still lack a gem the
+      # test suite needs, where a distro left it out. One probe, and
+      # a gem install only when something is missing. Running here,
+      # for every invocation, is what makes a fresh machine say what
+      # is missing up front instead of crashing on a `require` deep
+      # inside a run.
+      ensure_ruby_gems
+      return
+   fi
+
+   if [[ -f "$RUBY" ]]; then
+      echo "System Ruby is too old. Required >= $RUBY_MIN_VER"
+      export HAVE_OLD_RUBY=1
+      unset RUBY
+   fi
+
+   # Now let's determine if we're running on one of the Ubuntu or Debian
+   # versions for which we already have Ruby 3.4.7 pre-compiled.
+
+   if [ -f $os_rel ]; then
+
+      ver="$(grep VERSION_ID $os_rel | cut -d '=' -f 2 | tr -d '"')"
+      distro="$(grep -E '^ID=' $os_rel | cut -d '=' -f 2 | tr -d '"')"
+
+      if [[ "$distro" == *buntu ]]; then
+         distro="ubuntu"
+      fi
+
+      if [[ "$distro" != "" && "$ver" != "" ]]; then
+         echo "INFO: Detected distro $distro $ver on $HOST_ARCH"
+         download_ruby "$distro" "$ver"
+      fi
+   fi
+
+   if [ -f "$RUBY" ]; then
+      echo "Using local Ruby: $RUBY"
+      return
+   fi
+
+   if [[ "$HAVE_OLD_RUBY" == "" ]]; then
+      # It makes sense installing the packages and Ruby only if Ruby wasn't
+      # already in the system. Otherwise, we would waste time, when it was
+      # clear that Ruby is installed but it's too old and we need to build
+      # it from source.
+      echo "INFO: run install_packages() which will also install Ruby"
+      install_packages
+      export SKIP_INSTALL_PACKAGES=1
+
+      RUBY="$(which ruby)"
+      if check_ruby_ver; then
+         echo "INFO: using system Ruby: $RUBY"
+         return
+      fi
+
+      if [[ -f "$RUBY" ]]; then
+         echo "System Ruby is too old. Required >= $RUBY_MIN_VER"
+         unset RUBY
+      fi
+   fi
+
+   build_ruby
+}
+
+function create_base_dirs {
+
+   mkdir -p $TC
+   mkdir -p $TC/cache
+   mkdir -p $TC/noarch
+   mkdir -p $(dirname $RUBY_INSTALL_DIR)
+
+   # The rest of the directories are created by the Ruby package manager
+}
+
+# Set HOST_OS (linux|macos|freebsd) and HOST_DISTRO (e.g. ubuntu-22.04).
+# Keep this in sync with InitOnly.get_host_os / get_host_distro in
+# scripts/pkgmgr/early_logic.rb — the bash bootstrap needs to compute
+# RUBY_INSTALL_DIR *before* Ruby is available, so the logic has to live
+# in both languages.
+function detect_host_env {
+
+   case "$OS" in
+      Linux)   HOST_OS="linux" ;;
+      Darwin)  HOST_OS="macos" ;;
+      FreeBSD) HOST_OS="freebsd" ;;
+      *)
+         echo "ERROR: unsupported host OS: $OS"
+         exit 1
+         ;;
+   esac
+
+   case "$HOST_OS" in
+      linux)
+         if ! [ -f /etc/os-release ]; then
+            echo "ERROR: /etc/os-release not found"
+            exit 1
+         fi
+         local distro_id=$(grep -E '^ID=' /etc/os-release | cut -d= -f2 \
+            | tr -d '"')
+         local distro_ver=$(grep -E '^VERSION_ID=' /etc/os-release \
+            | cut -d= -f2 | tr -d '"')
+         local build_id=$(grep -E '^BUILD_ID=' /etc/os-release \
+            | cut -d= -f2 | tr -d '"')
+         local id_like=$(grep -E '^ID_LIKE=' /etc/os-release \
+            | cut -d= -f2 | tr -d '"')
+         # A rolling distro's env is its ID alone: see
+         # InitOnly.rolling_distro? in scripts/pkgmgr/early_logic.rb.
+         if [ "$build_id" = "rolling" ] || [ "$distro_id" = "arch" ] \
+               || [[ " $id_like " == *" arch "* ]] || [ -z "$distro_ver" ]
+         then
+            HOST_DISTRO="$distro_id"
+         else
+            HOST_DISTRO="${distro_id}-${distro_ver}"
+         fi
+         ;;
+      macos)
+         # Use only major.minor (e.g. "26.4") so a minor-patch bump like
+         # 26.4 -> 26.4.1 doesn't orphan the distro subtree.
+         HOST_DISTRO="macos-$(sw_vers -productVersion | cut -d. -f1,2)"
+         ;;
+      freebsd)
+         HOST_DISTRO="freebsd-$(uname -r | cut -d- -f1)"
+         ;;
+   esac
+}
+
+function dump_build_toolchain_env {
+
+   echo
+   echo "Input ENV vars"
+   echo "---------------"
+   echo "ARCH=$ARCH"
+   echo "GCC_TC_VER=$GCC_TC_VER"
+   echo "BOARD=$BOARD"
+   echo "CC=$CC"
+   echo "CXX=$CXX"
+   echo "RUBY=$RUBY"
+   echo "SKIP_INSTALL_PACKAGES=$SKIP_INSTALL_PACKAGES"
+   echo
+   echo "Other context"
+   echo "---------------"
+   echo "uname -m: $(uname -m)"
+   echo
+}
+
+##########################################################
+#
+# MAIN
+#
+##########################################################
+
+
+: ${TCROOT_PARENT:=$MAIN_DIR}
+: ${TCROOT:=$TCROOT_PARENT/$TOOLCHAIN_DIR_NAME}
+TC="$TCROOT"
+export TCROOT
+
+if ! [ "$QUIET" = 1 ]; then
+   dump_build_toolchain_env
+fi
+
+set_host_arch_variable
+detect_host_env
+
+# The bootstrap Ruby lives under the distro slot (no host-compiler level):
+# Ruby dynamically links against libc/libssl/etc. from the current distro,
+# but the host C/C++ compiler used to build it is irrelevant for running
+# Ruby itself. The full Ruby package manager layout (with a host-cc level)
+# applies only to *registered* non-portable packages.
+# Ruby is a package like any other and lives at the same three
+# coordinates: it runs on this machine, it needs this distro (a
+# prebuilt binary is built for it, and a source build links its
+# libssl/libyaml/libffi), and no particular compiler matters.
+#
+#   <machine>/<env>/<stack>/pkgs/<pkg>/<ver>/
+#
+# It cannot be portable: that would mean building it inside our own
+# stack, and the stack is built by pkgmgr, which needs Ruby. Bash
+# performs the first install because it is what runs pkgmgr, but it
+# writes to the canonical location so pkgmgr can see it.
+RUBY_COORDS="$HOST_OS-$HOST_ARCH/$HOST_DISTRO/any"
+RUBY_INSTALL_DIR="$TC/$RUBY_COORDS/pkgs/ruby/$HOST_VER_RUBY"
+
+if [[ "$1" == "-n" || $1 == "--skip-install-pkgs" ]]; then
+   export SKIP_INSTALL_PACKAGES=1
+fi
+
+# --contrib is handled on BOTH layers: here (bash) to trigger the
+# install of system packages that contributors need (e.g. clang,
+# extra dev libs), AND on the Ruby side, where it adds extra
+# toolchain packages (host_mconf, ...) to the default install
+# set. It must therefore be forwarded to the Ruby pkgmgr after being
+# observed here.
+#
+# --only-system-deps is consumed here and NOT forwarded — it's
+# bash-only (we exit before Ruby runs).
+ONLY_SYSTEM_DEPS=0
+new_args=()
+for arg in "$@"; do
+   case "$arg" in
+      --contrib)          export CONTRIB_PACKAGES=1
+                          new_args+=("$arg") ;;
+      --only-system-deps) ONLY_SYSTEM_DEPS=1 ;;
+      *)                  new_args+=("$arg") ;;
+   esac
+done
+set -- "${new_args[@]}"
+
+create_base_dirs
+
+# Check/install system packages only when invoked with no arguments,
+# with --contrib, or with --only-system-deps. Any other explicit flag
+# (-l, -h, -s, etc.) skips the check.
+if [[ "$SKIP_INSTALL_PACKAGES" != "1" ]]; then
+   if [[ $# -eq 0 || "$CONTRIB_PACKAGES" == "1" || "$ONLY_SYSTEM_DEPS" == "1" ]]; then
+      install_packages
+      export SKIP_INSTALL_PACKAGES=1
+   fi
+fi
+
+# --only-system-deps: exit now, skip the Ruby package manager entirely.
+# Useful for Docker layer caching: system deps in one layer, toolchain
+# packages in subsequent layers.
+if [[ "$ONLY_SYSTEM_DEPS" == "1" ]]; then
+   exit 0
+fi
+
+setup_ruby
+
+if ! [ "$QUIET" = 1 ]; then
+   echo
+   echo
+   echo "Ruby package manager"
+   echo "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+   echo
+fi
+
+exec $RUBY $MAIN_DIR/scripts/pkgmgr/main.rb "$@"

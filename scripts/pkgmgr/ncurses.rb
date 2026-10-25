@@ -1,0 +1,258 @@
+# SPDX-License-Identifier: BSD-2-Clause
+
+require_relative 'early_logic'
+require_relative 'arch'
+require_relative 'version'
+require_relative 'package'
+require_relative 'cache'
+require_relative 'package_manager'
+
+#
+# Shared SourceRef: NcursesPackage (target, cross-compiled for Orion)
+# and NcursesHostPackage (host, native build used by busybox and u-boot
+# menuconfig) both fetch from the same upstream — the tarball is
+# downloaded once and cached.
+#
+NCURSES_SOURCE = SourceRef.new(
+  name: 'ncurses',
+  url:  'https://ftp.gnu.org/pub/gnu/ncurses',
+  tarname: ->(ver) { "ncurses-#{ver}.tar.gz" },
+)
+
+class NcursesPackage < Package
+
+  include FileShortcuts
+  include FileUtilsShortcuts
+
+  def initialize
+    super(
+      name: 'ncurses',
+      source: NCURSES_SOURCE,
+      on_host: false,
+      is_compiler: false,
+      arch_list: ALL_ARCHS.values,
+      dep_list: []
+    )
+  end
+
+  def expected_files(ver = nil) = [
+    ["install/lib/libncurses.a", false]
+  ]
+
+  def build_steps(ver = default_ver)
+
+    arch = default_arch().gcc_tc
+
+    # Pass --build so configure sets cross_compiling=yes immediately
+    # (when both --host and --build are set and differ).  Without it,
+    # configure sets cross_compiling=maybe and tries to run a cross-
+    # compiled test binary, which on FreeBSD triggers a kernel
+    # uprintf "ELF binary type '0' not known." to the terminal.
+    #
+    # BUILD_CC tells ncurses which compiler to use for host-side
+    # build tools; without it BUILD_CC defaults to $CC (the cross-
+    # compiler) causing the same exec-of-Linux-binary problem.
+    host_cc = "cc"
+    build_triple = "#{HOST_ARCH.name}-unknown-#{HOST_OS}"
+
+    return [
+
+      # The ncurses tarball ships an `INSTALL` documentation file
+      # that, on case-insensitive filesystems (e.g. APFS on macOS),
+      # collides with the `install/` prefix directory `make install`
+      # wants to create. The file is documentation only -- no Makefile
+      # target depends on it -- so remove it to make `mkdir install`
+      # work. Remove never minds a file that is not there.
+      Remove(paths: ["INSTALL"]),
+
+      Run(log: "configure.log", argv: [
+        "./configure",
+        "--host=#{arch}-pc-linux-gnu",
+        "--build=#{build_triple}",
+        "--prefix=$INSTALL/install",
+        "--datarootdir=/usr/share",
+        "--disable-db-install",
+        "--disable-widec",
+        "--without-progs",
+        "--without-cxx",
+        "--without-cxx-binding",
+        "--without-ada",
+        "--without-manpages",
+        "--without-dlsym",
+        "BUILD_CC=#{host_cc}",
+      ]),
+
+      Run(log: "build.log", argv: ["make", "-j$PAR"]),
+      Run(log: "install.log", argv: ["make", "install"]),
+    ]
+  end
+end
+
+#
+# Host-native ncurses build. Shares NCURSES_SOURCE with the target
+# build above — the tarball is fetched once and extracted twice (once
+# for the target cross-compile, once for the host-native compile).
+#
+# Used by busybox's and u-boot's `-C` (menuconfig) flows so that the
+# kconfig host tools (mconf, nconf) link against a pinned ncurses that
+# is consistent across host distributions, instead of relying on
+# libncurses-dev being installed on the host (fine on Debian/Fedora/
+# Arch/FreeBSD, but unreliable on macOS where the system ncurses is
+# old and keg-only via Homebrew).
+#
+class NcursesHostPackage < Package
+
+  include FileShortcuts
+  include FileUtilsShortcuts
+
+  def initialize
+    super(
+      name: 'host_ncurses',
+      source: NCURSES_SOURCE,
+      on_host: true,
+      is_compiler: false,
+      host_tier: :distro,
+      arch_list: ALL_HOST_ARCHS.values,
+      dep_list: [],
+      default: true,
+    )
+  end
+
+  # Built with --enable-widec because busybox's and u-boot's kconfig
+  # check-lxdialog.sh prefers -lncursesw over -lncurses. Without the
+  # wide-char library in our install tree, the linker falls through
+  # to the system libncursesw — the exact failure mode this package
+  # is supposed to prevent. --with-termlib=tinfo splits terminfo into
+  # a separately-named libtinfo (not libtinfow) so -ltinfo in the
+  # kconfig link line also resolves locally.
+  #
+  # ncurses installs headers under include/ncursesw/ with widec (curses.h,
+  # term.h, etc.). Consumers that use pkg-config get the right -I flag
+  # automatically from ncursesw.pc; others need the explicit include
+  # paths published by build_env below.
+  def expected_files(ver = nil) = [
+    ["install/lib/libncursesw.a", false],
+    ["install/lib/libtinfo.a", false],
+    ["install/include/ncursesw/curses.h", false],
+    ["install/lib/pkgconfig/ncursesw.pc", false],
+  ]
+
+  # What dependents need to compile and link against this ncurses.
+  # With --enable-widec the headers land in include/ncursesw/, so both
+  # that directory and the top-level include/ are published: the former
+  # for sources that include <curses.h> directly, the latter for those
+  # spelling it <ncursesw/curses.h>. Consumers going through pkg-config
+  # find ncursesw.pc via the pkg-config dir instead.
+  def build_env(ver)
+
+    prefix = install_token / "install"
+
+    return BuildEnv.new(
+      include_dirs:    [prefix / "include", prefix / "include" / "ncursesw"],
+      lib_dirs:        [prefix / "lib"],
+      pkg_config_dirs: [prefix / "lib" / "pkgconfig"],
+    )
+  end
+
+  def build_steps(ver = default_ver)
+
+    # At runtime, ncurses needs to find terminfo entries for the
+    # user's $TERM. The system ncurses on each host distro has its
+    # own set of search paths compiled in; ours used to only know
+    # about --datarootdir=/usr/share, which missed tmux-256color on
+    # Ubuntu (the entry lives at /lib/terminfo/t/tmux-256color, not
+    # /usr/share/terminfo).
+    #
+    # Bake in every standard terminfo location across Linux / FreeBSD
+    # / macOS so `initscr()` resolves $TERM regardless of where the
+    # distro puts its database. Non-existent dirs are silently
+    # skipped at lookup time.
+    #
+    #   Linux   : /etc/terminfo, /lib/terminfo, /usr/share/terminfo
+    #   FreeBSD : /usr/share/misc/terminfo (base),
+    #             /usr/local/share/terminfo (ports),
+    #             /usr/local/share/site-terminfo (per-port)
+    #   Darwin  : /usr/share/terminfo (old, usually missing newer
+    #             entries), /opt/homebrew/share/terminfo (AS),
+    #             /opt/homebrew/opt/ncurses/share/terminfo (keg-only),
+    #             /usr/local/share/terminfo (Intel Homebrew)
+    terminfo_dirs = [
+      "/etc/terminfo",
+      "/lib/terminfo",
+      "/usr/share/terminfo",
+      "/usr/share/misc/terminfo",
+      "/usr/local/share/terminfo",
+      "/usr/local/share/site-terminfo",
+      "/opt/homebrew/share/terminfo",
+      "/opt/homebrew/opt/ncurses/share/terminfo",
+    ].join(":")
+
+    return [
+
+      # Same case-insensitive-FS workaround as the target build.
+      Remove(paths: ["INSTALL"]),
+
+      Run(log: "configure.log", argv: [
+        "./configure",
+        "--prefix=$INSTALL/install",
+        "--datarootdir=/usr/share",
+        "--disable-db-install",
+        "--with-terminfo-dirs=#{terminfo_dirs}",
+        # Wide-char ncurses: busybox/u-boot's kconfig prefers
+        # -lncursesw.
+        "--enable-widec",
+        # Split terminfo into a separately-named library so the
+        # kconfig link line's `-ltinfo` finds ours, not the system's.
+        # Without the =tinfo suffix the lib would be named libtinfow
+        # (widec default), which would NOT match `-ltinfo`.
+        "--with-termlib=tinfo",
+        # --enable-pc-files opts in to installing pkg-config files
+        # (OFF by default upstream); --with-pkg-config-libdir directs
+        # them into our tree so PKG_CONFIG_PATH can discover them
+        # without touching the system pkg-config search path.
+        "--enable-pc-files",
+        "--with-pkg-config-libdir=$INSTALL/install/lib/pkgconfig",
+        "--without-progs",
+        "--without-cxx",
+        "--without-cxx-binding",
+        "--without-ada",
+        "--without-manpages",
+      ]),
+
+      Run(log: "build.log", argv: ["make", "-j$PAR"]),
+      Run(log: "install.log", argv: ["make", "install"]),
+
+      # ncurses bakes the --prefix path -- which is the STAGING
+      # directory at configure time -- into its .pc files and into
+      # ncurses6-config. install_impl then moves staging to the final
+      # location and those baked paths dangle. Rewrite them to resolve
+      # at query time from the file's own location instead, so they
+      # survive the move.
+      #
+      # Every .pc sits at <prefix>/lib/pkgconfig/, so two levels up
+      # lands at <prefix>. A substitution that matches nothing fails
+      # the build: silently leaving a dangling path behind is the one
+      # outcome nobody would notice.
+      Substitute(path: "$INSTALL/install/lib/pkgconfig/*.pc", subs: [
+        [/^prefix=.+$/, 'prefix=${pcfiledir}/../..'],
+        ["$INSTALL/install", '${prefix}'],
+      ]),
+
+      # ncurses{,w}6-config is a POSIX shell script with the prefix
+      # baked in the same way; derive it from $0's directory
+      # (<prefix>/bin/ -> <prefix>). It is named ncurses6-config
+      # without widec and ncursesw6-config with --enable-widec. That
+      # line is the script's only mention of the staged path -- the
+      # rest of it goes through ${prefix} already -- so there is no
+      # second rewrite here, unlike the .pc files above. The helper
+      # this replaces ran one anyway, and it never matched.
+      Substitute(path: "$INSTALL/install/bin/ncurses*6-config", subs: [
+        [/^prefix="[^"]*"/,
+         'prefix="$(cd -- "$(dirname -- "$0")/.." && pwd)"'],
+      ]),
+    ]
+  end
+end
+
+pkgmgr.register(NcursesPackage.new())
+pkgmgr.register(NcursesHostPackage.new())

@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+
+AR="@CMAKE_AR@"
+RANLIB="@CMAKE_RANLIB@"
+OBJCOPY="@CMAKE_OBJCOPY@"
+ELFHACK_PREFIX="@ELFHACK_DIR@/install/bin/elfhack"
+ARCH_BITS="@ARCH_BITS@"
+HOST_ARCH_BITS="@HOST_ARCH_BITS@"
+ROOT="@CMAKE_SOURCE_DIR@"
+QUIET=1
+source $ROOT/scripts/bash_includes/script_utils
+
+ELFHACK=${ELFHACK_PREFIX}${HOST_ARCH_BITS}
+
+if printf "" &> /dev/null; then
+   has_printf=1
+fi
+
+PREFIX="${GREEN}[ WS ]${RATTRS} "
+
+if [ -z "$1" ]; then
+   >&2 echo -e "${PREFIX}Expected archive file"
+   exit 1
+fi
+
+if ! [ -f "$1" ]; then
+   >&2 echo -e "${PREFIX}The file '$1' does not exist"
+   exit 1
+fi
+
+file=$(realpath $1)
+shift
+
+TEMPDIR=$(mktemp -d -p .)
+
+if ! [ -d $TEMPDIR ]; then
+   >&2 echo -e "${PREFIX}Failed to create temp directory"
+   exit 1
+fi
+
+pushd $TEMPDIR &> /dev/null
+echo -e "${PREFIX}Extract all object files from archive $(basename $file)..."
+
+last_obj=""
+count=1
+
+for obj in `ar t $file | sort`; do
+
+   if [[ "$obj" != "$last_obj" ]]; then
+      count=1
+   else
+      count=$((count + 1))
+   fi
+
+   $AR xoN $count $file $obj
+   mv $obj $obj.$count.o
+   last_obj=$obj
+done
+
+echo -e "${PREFIX}Patch all the object files..."
+
+for obj in *; do
+
+   unset obj_syms_map
+   declare -A obj_syms_map
+
+   list=$($ELFHACK $obj --list-section-syms .text)
+
+   for x in $list; do
+      obj_syms_map[$x]=1
+   done
+
+   for sym in "$@"; do
+
+      if [[ ${obj_syms_map[$sym]} != 1 ]]; then
+         continue;
+      fi
+
+      addr=$($ELFHACK $obj --get-section-sym-value .text $sym)
+      sobj=${obj::-4}
+
+      if [[ $has_printf == 1 ]]; then
+         printf "${PREFIX}Weaken sym ${GREEN}%-35s${RATTRS} in %s\n" $sym $sobj
+      else
+         echo "${PREFIX}Weaken sym ${sym} in $sobj"
+      fi
+
+      $OBJCOPY $obj \
+         --add-symbol __real_$sym=.text:$addr,function,global \
+         --globalize-symbol=$sym \
+         --weaken-symbol=$sym \
+
+   done
+done
+
+echo -e "${PREFIX}Re-create the archive file $(basename $file)..."
+rm $file
+$AR qc $file *.o
+$RANLIB $file
+
+popd &> /dev/null
+rm -rf $TEMPDIR
+
+echo -e "${PREFIX}Done"

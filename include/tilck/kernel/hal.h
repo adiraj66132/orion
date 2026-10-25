@@ -1,0 +1,353 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* style_check: disable hex_literal_lowercase */
+
+#pragma once
+#define __TILCK_HAL__
+
+#include <tilck/common/basic_defs.h>
+#include <tilck/common/datetime.h>
+#include <tilck/kernel/hal_types.h>
+
+#define USERMODE_STACK_ALIGN              16ul
+
+#if defined(__i386__) || defined(__x86_64__)
+
+   #define arch_x86_family
+
+   #include <tilck/common/arch/generic_x86/x86_utils.h>
+   #include <tilck/common/arch/generic_x86/cpu_features.h>
+   #include <tilck/kernel/arch/generic_x86/fpu_memcpy.h>
+   #include <tilck/kernel/arch/generic_x86/arch_ints.h>
+   #include <tilck/kernel/arch/generic_x86/mmio.h>
+
+   #if defined(__x86_64__)
+
+      #include <tilck/common/arch/x86_64/utils.h>
+      #include <tilck/kernel/arch/x86_64/arch_utils.h>
+
+   #else
+
+      #include <tilck/common/arch/i386/utils.h>
+      #include <tilck/kernel/arch/i386/asm_defs.h>
+      #include <tilck/kernel/arch/i386/arch_utils.h>
+      #include <tilck/kernel/arch/i386/tss.h>
+
+   #endif
+
+#elif defined(__riscv)
+
+   #include <tilck/common/arch/riscv/riscv_utils.h>
+   #include <tilck/common/arch/riscv/utils.h>
+   #include <tilck/common/arch/riscv/image.h>
+   #include <tilck/kernel/arch/riscv/sbi.h>
+   #include <tilck/kernel/arch/riscv/mmio.h>
+   #include <tilck/kernel/arch/riscv/ioremap.h>
+   #include <tilck/kernel/arch/riscv/arch_ints.h>
+   #include <tilck/kernel/arch/riscv/asm_defs.h>
+   #include <tilck/kernel/arch/riscv/arch_utils.h>
+   #include <tilck/kernel/arch/riscv/fpu_memcpy.h>
+   #include <tilck/kernel/arch/riscv/cpu_features.h>
+
+   static ALWAYS_INLINE void init_segmentation(void)
+   {
+      /* STUB function: do nothing */
+   }
+
+#elif defined(__aarch64__)
+
+   #if defined(UNIT_TEST_ENVIRONMENT)
+
+      /*
+       * Fake stub funcs and defines, just to allow the build of the kernel for
+       * the unit tests
+       */
+
+      #define ALL_FAULTS_MASK (0xFFFFFFFF)
+      #define PAGE_FAULT_MASK (1 << 14)
+      #define SYSCALL_SOFT_INTERRUPT 0x80
+      #define COM1 0
+      #define COM2 1
+      #define COM3 2
+      #define COM4 3
+      #define X86_PC_TIMER_IRQ 0
+
+      /*
+       * IRQ-state stubs for tests live in the cross-arch
+       * UNIT_TEST_ENVIRONMENT block below (after the arch
+       * dispatch). They apply equally to gtests built for x86_64
+       * and aarch64 hosts, and to any future host architecture.
+       */
+
+      static ALWAYS_INLINE void __set_curr_pdir(ulong paddr)
+      {
+         /* STUB function: do nothing */
+      }
+
+      static ALWAYS_INLINE ulong __get_curr_pdir()
+      {
+         NOT_IMPLEMENTED();
+         __builtin_unreachable();
+      }
+
+      static ALWAYS_INLINE void set_return_register(regs_t *r, ulong value)
+      {
+         /* STUB function: do nothing */
+      }
+
+      static ALWAYS_INLINE int int_to_irq(int int_num)
+      {
+         NOT_IMPLEMENTED();
+         __builtin_unreachable();
+      }
+
+      static ALWAYS_INLINE bool is_irq(int int_num)
+      {
+         NOT_IMPLEMENTED();
+         __builtin_unreachable();
+      }
+
+      static ALWAYS_INLINE bool is_timer_irq(int int_num)
+      {
+         NOT_IMPLEMENTED();
+         __builtin_unreachable();
+      }
+
+      static ALWAYS_INLINE bool is_fault(int int_num)
+      {
+         NOT_IMPLEMENTED();
+         __builtin_unreachable();
+      }
+
+      static ALWAYS_INLINE int regs_intnum(regs_t *r)
+      {
+         NOT_IMPLEMENTED();
+         __builtin_unreachable();
+      }
+
+      static ALWAYS_INLINE void halt(void)
+      {
+         /* STUB function: do nothing */
+      }
+
+      static ALWAYS_INLINE void init_fpu_memcpy(void)
+      {
+         /* STUB function: do nothing */
+      }
+
+      static ALWAYS_INLINE bool in_hypervisor(void)
+      {
+         return false;
+      }
+
+      static ALWAYS_INLINE ulong get_rem_stack(void)
+      {
+         return KERNEL_STACK_SIZE;
+      }
+
+      static ALWAYS_INLINE ulong get_stack_ptr(void)
+      {
+         return 0;
+      }
+
+      static ALWAYS_INLINE u64 RDTSC(void)
+      {
+         return 0;
+      }
+
+      static ALWAYS_INLINE ulong regs_get_usersp(regs_t *r)
+      {
+         return 0;
+      }
+
+      static ALWAYS_INLINE void regs_set_usersp(regs_t *r, ulong val)
+      {
+         /* STUB function: do nothing */
+      }
+
+      static ALWAYS_INLINE void init_segmentation(void)
+      {
+         /* STUB function: do nothing */
+      }
+
+      static ALWAYS_INLINE ulong get_return_register(regs_t *r)
+      {
+         return 0;
+      }
+
+      static ALWAYS_INLINE void *regs_get_frame_ptr(regs_t *r)
+      {
+         return NULL;
+      }
+
+      static ALWAYS_INLINE void regs_set_ip(regs_t *r, ulong value)
+      {
+         /* STUB function: do nothing */
+      }
+
+      NORETURN static ALWAYS_INLINE void context_switch(regs_t *r)
+      {
+         NOT_REACHED();
+      }
+
+   #else // defined(UNIT_TEST_ENVIRONMENT)
+
+      #error Non-test aarch64 is not supported
+
+   #endif /* UNIT_TEST_ENVIRONMENT */
+
+#else
+
+   #error Unsupported architecture.
+
+#endif /* __i386__ || __x86_64__ */
+
+#ifdef UNIT_TEST_ENVIRONMENT
+   /*
+    * Cross-arch IRQ-state tracking for the gtest build. The
+    * arch-specific headers above skip defining the disable /
+    * enable / are_interrupts_enabled trio under
+    * UNIT_TEST_ENVIRONMENT; this block provides them in a way
+    * that works on any host arch (x86_64 and aarch64 today,
+    * whatever Orion builds gtests on tomorrow).
+    *
+    * The counter starts at 0 (interrupts logically enabled), so
+    * code that ASSERTs `are_interrupts_enabled()` keeps passing.
+    * Kernel critical sections that bracket work with
+    * disable_interrupts() / enable_interrupts() bump the counter,
+    * so code that ASSERTs `!are_interrupts_enabled()` inside the
+    * scope works too. `var` is saved/restored just to mirror the
+    * production save-and-restore-EFLAGS shape; tests don't care
+    * about its value.
+    *
+    * The storage lives in tests/unit/misc_fake.c.
+    */
+   extern int __tilck_test_irqs_disabled;
+
+   static ALWAYS_INLINE bool are_interrupts_enabled(void)
+   {
+      return __tilck_test_irqs_disabled == 0;
+   }
+
+   static ALWAYS_INLINE void disable_interrupts(ulong *var)
+   {
+      if (var)
+         *var = (ulong) __tilck_test_irqs_disabled;
+      __tilck_test_irqs_disabled++;
+   }
+
+   static ALWAYS_INLINE void enable_interrupts(ulong *var)
+   {
+      __tilck_test_irqs_disabled--;
+   }
+
+   static ALWAYS_INLINE void disable_interrupts_forced(void)
+   {
+      __tilck_test_irqs_disabled++;
+   }
+
+   static ALWAYS_INLINE void enable_interrupts_forced(void)
+   {
+      __tilck_test_irqs_disabled--;
+   }
+#endif
+
+STATIC_ASSERT(ARCH_TASK_MEMBERS_SIZE == sizeof(arch_task_members_t));
+STATIC_ASSERT(ARCH_TASK_MEMBERS_ALIGN == alignof(arch_task_members_t));
+
+STATIC_ASSERT(ARCH_PROC_MEMBERS_SIZE == sizeof(arch_proc_members_t));
+STATIC_ASSERT(ARCH_PROC_MEMBERS_ALIGN == alignof(arch_proc_members_t));
+
+/*
+ * On non-Linux hosts (e.g., macOS, FreeBSD), <unistd.h> declares a
+ * different reboot() which conflicts with Orion's. In KERNEL_TEST on
+ * such hosts, the kernel's reboot/poweroff are never called, so skip.
+ */
+#if !defined(UNIT_TEST_ENVIRONMENT) || defined(__linux__)
+NORETURN void reboot(void);
+NORETURN void poweroff(void);
+#endif
+void init_segmentation(void);
+void init_cpu_exception_handling(void);
+void init_syscall_interfaces(void);
+void set_kernel_stack(ulong stack);
+void enable_cpu_features(void);
+void fpu_context_begin(void);
+void fpu_context_end(void);
+void save_current_fpu_regs(bool in_kernel);
+void restore_fpu_regs(void *task, bool in_kernel);
+void restore_current_fpu_regs(bool in_kernel);
+int get_irq_num(regs_t *context);
+int get_int_num(regs_t *context);
+void on_first_pdir_update(void);
+extern void (*hw_read_clock)(struct datetime *out);
+void hw_read_clock_cmos(struct datetime *out);
+
+/*
+ * RTC Update-Ended interrupt (UIE) support.
+ *
+ * The CMOS RTC chip can fire IRQ 8 at every wall-clock second
+ * boundary when its UIE bit is set. This is a much cleaner way to
+ * detect the exact moment the wall-clock second changes than
+ * polling the seconds register in a loop -- the IRQ handler
+ * snapshots `__time_ns` at the precise instant of the edge and
+ * signals waiters via a kcond, so the caller gets sub-microsecond
+ * precision without burning CPU.
+ *
+ * UIE is part of the IBM PC AT specification (MC146818 / DS12887
+ * and successors) and is universally available on x86 PCs from
+ * 1984 onwards, in every PC-class hypervisor, and in every modern
+ * Southbridge / PCH. Other arches with an equivalent RTC interrupt
+ * (e.g. goldfish on riscv64) can implement these to plug into the
+ * same drift-compensation logic; the default WEAK stubs in
+ * kernel/misc.c make them no-ops where not implemented.
+ *
+ * Usage:
+ *
+ *    u64 edge_ns;
+ *    if (rtc_wait_for_second_edge(&edge_ns, KRN_TIMER_HZ * 2)) {
+ *       // edge_ns is __time_ns at the moment the RTC second
+ *       // ticked over. hw_read_clock() now returns the wall-clock
+ *       // time of that exact moment.
+ *    }
+ *
+ * Returns true on signal, false on timeout.
+ */
+void init_rtc_uie(void);
+bool rtc_wait_for_second_edge(u64 *time_ns_out, u32 timeout_ticks);
+/*
+ * Per-tick wall-clock advance, as returned by hw_timer_setup().
+ *
+ * The simple "ns per IRQ" integer is `ns_per_tick`. To avoid the
+ * truncation that would otherwise accumulate (the divisor / PIT_FREQ
+ * ratio rarely has an integer ns representation), the function also
+ * returns a `(frac_per_tick, frac_denom)` pair the caller uses to
+ * track the residue:
+ *
+ *    each tick:
+ *       __time_ns      += ns_per_tick;
+ *       __frac_acc     += frac_per_tick;
+ *       if (__frac_acc >= frac_denom) {
+ *          __frac_acc   -= frac_denom;
+ *          __time_ns    += 1;
+ *       }
+ *
+ * Architectures that don't bother with fractional accuracy can set
+ * `frac_per_tick = 0` and any non-zero `frac_denom`; the if-branch
+ * is then dormant.
+ */
+struct hw_timer_info {
+
+   u32 ns_per_tick;     /* integer ns advanced per timer IRQ */
+   u32 frac_per_tick;   /* residue numerator per IRQ */
+   u32 frac_denom;      /* denominator (when acc reaches this, +1 ns) */
+};
+
+void hw_timer_setup(u32 hz, struct hw_timer_info *out);
+
+bool allocate_fpu_regs(arch_task_members_t *arch_fields);
+void copy_main_tss_on_regs(regs_t *ctx);
+void arch_add_initial_mem_regions(void);
+bool arch_add_final_mem_regions(void);
+
+#define get_task_arch_fields(ti) ((arch_task_members_t*)(void*)((ti)->ti_arch))
+#define get_proc_arch_fields(pi) ((arch_proc_members_t*)(void*)((pi)->pi_arch))

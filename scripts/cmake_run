@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: BSD-2-Clause
+
+# Constants
+GCC_MIN_VERSION="11.3.0"
+GXX_MIN_VERSION="11.3.0"
+
+# Project's root directory
+SOURCE_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+MAIN_DIR="$(cd $SOURCE_DIR/.. && pwd)"
+source $MAIN_DIR/other/toolchain_conf   # TOOLCHAIN_DIR_NAME
+
+: ${TCROOT_PARENT:=$MAIN_DIR}
+: ${TCROOT:=$TCROOT_PARENT/$TOOLCHAIN_DIR_NAME}
+
+source $MAIN_DIR/scripts/bash_includes/script_utils
+source $MAIN_DIR/other/pkg_versions
+source $MAIN_DIR/other/host_pkg_versions
+
+
+set_host_arch_variable   # set $HOST_ARCH
+
+# Legacy toolchain3 path used only to probe for a bundled cmake binary
+# below. The cmake package has not been ported to the Ruby pkgmgr yet,
+# so on toolchain4 this will not exist and we'll fall back to system
+# cmake. Once cmake moves into the Ruby pkgmgr, this should point at
+# the new host-tool install root.
+HOST_ARCH_DIR_SYS=$TCROOT/syscc/host_$HOST_ARCH
+
+show_help() {
+
+   echo
+   echo "cmake_run -- configure Orion's build directory and run CMake."
+   echo
+   echo "Usage:"
+   echo "   cmake_run [--contrib] [--intr] [--gcov] [extra cmake args...]"
+   echo "   cmake_run -h | --help"
+   echo
+   echo "Mode flags (independent; all 8 combinations are valid):"
+   echo
+   echo "   --contrib   Contributor stress build: clang, -Wconversion,"
+   echo "               UBSAN, kmalloc heavy stats + free-mem poisoning,"
+   echo "               forced preemption, TIMER_HZ=250, bootloader poison."
+   echo
+   echo "   --intr      Interactive-tests build: 2 TTYs, EXTRA_VIM, plain fb"
+   echo "               console, 640x480 gfx, auto-boot, acpi module off."
+   echo
+   echo "   --gcov      Enable code coverage for the kernel and the unit"
+   echo "               tests (exports TEST_GCOV=1 and KERNEL_GCOV=1)."
+   echo
+   echo "   -h, --help  Show this help and exit."
+   echo
+   echo "Any other argument is forwarded verbatim to cmake, e.g.:"
+   echo "   -DRELEASE=1       -O3 release build (also: env RELEASE=1 or REL=1)"
+   echo "   -DARCH=riscv64    cross-build for another target arch"
+   echo "   -DDEBUG_CHECKS=0  disable debug checks"
+   echo
+   echo "Examples:"
+   echo "   cmake_run --gcov"
+   echo "   cmake_run --intr --gcov           # full coverage incl. interactive"
+   echo "   cmake_run --contrib -DARCH=riscv64"
+   echo
+}
+
+# Parse cmake_run's own flags. They are independent and combinable; any
+# other argument is forwarded verbatim to cmake.
+
+opt_contrib=0
+opt_intr=0
+opt_gcov=0
+declare -a EXTRA_ARGS=()
+
+while [ $# -gt 0 ]; do
+   case "$1" in
+      --contrib) opt_contrib=1 ;;
+      --intr)    opt_intr=1 ;;
+      --gcov)    opt_gcov=1 ;;
+      -h|--help) show_help; exit 0 ;;
+      *)         EXTRA_ARGS+=("$1") ;;
+   esac
+   shift
+done
+set -- "${EXTRA_ARGS[@]}"
+
+# Seed from any CMAKE_ARGS inherited from the environment: the CI jobs and
+# build_generators/* pass their build flags this way and call cmake_run with
+# no mode flag. The mode flags below append to it, never clobber it.
+CMAKE_ARGS="${CMAKE_ARGS:-}"
+
+if [ $opt_contrib -eq 1 ]; then
+
+   export CC='clang'
+   export CXX='clang++'
+   CMAKE_ARGS="$CMAKE_ARGS -DKERNEL_SYSCC=1 -DWCONV=1"
+   CMAKE_ARGS="$CMAKE_ARGS -DKRN_KMALLOC_HEAVY_STATS=1 -DKRN_TIMER_HZ=250"
+   CMAKE_ARGS="$CMAKE_ARGS -DTERM_BIG_SCROLL_BUF=1"
+   CMAKE_ARGS="$CMAKE_ARGS -DKRN_RESCHED_ENABLE_PREEMPT=1"
+   CMAKE_ARGS="$CMAKE_ARGS -DKERNEL_UBSAN=1"
+   CMAKE_ARGS="$CMAKE_ARGS -DBOOTLOADER_POISON_MEMORY=1"
+   CMAKE_ARGS="$CMAKE_ARGS -DKRN_KMALLOC_FREE_MEM_POISONING=1"
+fi
+
+if [ $opt_intr -eq 1 ]; then
+
+   # --contrib already pins clang; otherwise default the interactive
+   # build to gcc, as this mode has always done.
+   if [ $opt_contrib -eq 0 ]; then
+      export CC="gcc"
+      export CXX="g++"
+   fi
+
+   CMAKE_ARGS="$CMAKE_ARGS -DKRN_FB_CONSOLE_BANNER=0"
+   CMAKE_ARGS="$CMAKE_ARGS -DKRN_FB_CONSOLE_CURSOR_BLINK=0"
+   CMAKE_ARGS="$CMAKE_ARGS -DKRN_FB_CONSOLE_USE_ALT_FONTS=0 -DTTY_COUNT=2"
+   CMAKE_ARGS="$CMAKE_ARGS -DEXTRA_VIM=1 -DKRN_NO_SYS_WARN=0"
+   CMAKE_ARGS="$CMAKE_ARGS -DBOOT_INTERACTIVE=0 -DPREFERRED_GFX_MODE_W=640"
+   CMAKE_ARGS="$CMAKE_ARGS -DPREFERRED_GFX_MODE_H=480 -DMOD_acpi=0"
+fi
+
+if [ $opt_gcov -eq 1 ]; then
+   # Read straight from the environment by CMake (define_env_cache_bool_var),
+   # so they must be exported, not passed as -D.
+   export TEST_GCOV=1
+   export KERNEL_GCOV=1
+fi
+
+CMAKE_ARGS="${CMAKE_ARGS# }"
+export CMAKE_ARGS
+
+if [ $opt_contrib -eq 1 ] || [ $opt_intr -eq 1 ] || [ $opt_gcov -eq 1 ]; then
+
+   modes=""
+   [ $opt_contrib -eq 1 ] && modes="$modes contrib"
+   [ $opt_intr -eq 1 ]    && modes="$modes intr"
+   [ $opt_gcov -eq 1 ]    && modes="$modes gcov"
+
+   echo
+   echo -e "${YELLOW}cmake_run${RATTRS} mode:${LGREEN}${modes}${RATTRS}"
+   echo
+
+   if [ $opt_contrib -eq 1 ] || [ $opt_intr -eq 1 ]; then
+      echo -e "   - CC=${LMAGENTA}'${CC}'${RATTRS}"
+      echo -e "   - CXX=${LMAGENTA}'${CXX}'${RATTRS}"
+   fi
+
+   if [ $opt_gcov -eq 1 ]; then
+      echo -e "   - TEST_GCOV=${LMAGENTA}'1'${RATTRS}," \
+              "KERNEL_GCOV=${LMAGENTA}'1'${RATTRS}"
+   fi
+
+   echo -e "   - CMAKE_ARGS=${LMAGENTA}'${CMAKE_ARGS}'${RATTRS}"
+   echo
+fi
+
+curr_dir="`pwd`"
+
+if [[ "$curr_dir" == "$MAIN_DIR" ]]; then
+   build_dir="$MAIN_DIR/build"
+   mkdir -p "$build_dir"
+else
+   build_dir="$curr_dir"
+fi
+
+echo "[cmake_run] Using '$build_dir' as build directory"
+
+# If CC is set but the file $CC does not exist
+# replace CC with `which $CC` (its absolute path)
+if [ -n "$CC" ] && [ ! -f "$CC" ]; then
+   CC="`which $CC`"
+fi
+
+# If CXX is set but the file $CXX does not exist
+# replace CXX with `which $CXX` (its absolute path)
+if [ -n "$CXX" ] && [ ! -f "$CXX" ]; then
+   CXX="`which $CXX`"
+fi
+
+# Check compiler's version only if this is the first time we ran CMake:
+# after that, CMake will cache compiler's information and changing CC/CXX
+# won't affect the build at all.
+
+if ! [ -f "$build_dir/CMakeCache.txt" ]; then
+
+   if [ -z "$CC" ]; then
+      CC="gcc"
+   fi
+
+   if [ -z "$CXX" ]; then
+      CXX="g++"
+   fi
+
+   if ! which $CC &> /dev/null; then
+      echo "CC compiler '$CC' not found."
+      exit 1
+   fi
+
+   if ! which $CXX &> /dev/null; then
+      echo "CXX compiler '$CXX' not found."
+      exit 1
+   fi
+
+   if $CC --version | grep gcc &> /dev/null; then
+      ver=$(generic_get_version_str $CC)
+      fail_if_too_old $CC $ver $GCC_MIN_VERSION
+   fi
+
+   if $CXX --version | grep g++ &> /dev/null; then
+      ver=$(generic_get_version_str $CXX)
+      fail_if_too_old $CXX $ver $GXX_MIN_VERSION
+   fi
+fi
+
+export CC
+export CXX
+
+if [ -f $HOST_ARCH_DIR_SYS/cmake/$HOST_VER_CMAKE/bin/cmake ]; then
+   export CMAKE="$HOST_ARCH_DIR_SYS/cmake/$HOST_VER_CMAKE/bin/cmake"
+else
+   export CMAKE="cmake"
+fi
+
+if [[ "$RELEASE" == "1" || "$REL" == "1" ]]; then
+   BUILD_TYPE="Release"
+else
+   BUILD_TYPE="Debug"
+fi
+
+
+echo "[cmake_run] Using '$CMAKE' as CMake executable"
+
+cd $build_dir
+
+$CMAKE                                 \
+   -DCMAKE_BUILD_TYPE=$BUILD_TYPE      \
+   -DCMAKE_EXPORT_COMPILE_COMMANDS=1   \
+   $CMAKE_ARGS "$@" "$MAIN_DIR"

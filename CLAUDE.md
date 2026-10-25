@@ -1,0 +1,1198 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with
+code in this repository.
+
+## Project Overview
+
+Orion is an educational monolithic kernel designed to be Linux-compatible at
+binary level. It runs on i386 (primary), riscv64, and x86_64. It implements
+~100 Linux syscalls and runs mainstream Linux programs (BusyBox, Vim, TinyCC,
+Micropython, Lua) without custom rewrites. ~13,300 lines of kernel code.
+Licensed BSD 2-Clause.
+
+## Originality and licensing (BSD-2-Clause)
+
+Orion must remain 100% original work. **Never copy implementation code,
+identifiers, struct layouts, or macro idioms from Linux, glibc, or any
+GPL/copyleft/incompatibly-licensed source.** High-level *ideas* and
+well-known techniques (exception tables, scheduler designs, etc.) are fine to
+learn from and reimplement — the concrete code must be written from scratch in
+Orion's style. When borrowing a technique from Linux/FreeBSD, give it a
+Orion-native name and a from-scratch implementation; don't mirror their
+identifiers (`__ex_table`, `fixup_exception`, `pcb_onfault`, ...). If unsure
+whether something crosses from idea into copying, stop and ask.
+
+## No hacks: use the proper abstraction
+
+Orion is a top-quality software project. **Never add a hack, a shortcut,
+or a "temporary" special case.** Every problem gets the abstraction it
+actually needs, in every language in the tree (C, Ruby, Python, CMake).
+
+The most common failure mode is *sharing code by putting concrete
+knowledge in a generic place*. When two consumers need the same thing,
+do not add a provider-specific helper to their common base class: that
+teaches the base class about one concrete subject, and every other user
+of that base class inherits knowledge it must not have.
+
+Real example from this repo (`scripts/pkgmgr/package.rb`, commit
+bf0e54e33): `Package#host_ncurses_build_flags` was added to the abstract
+`Package` class, hardcoding `pkgmgr.get("host_ncurses")` and returning
+ncurses-specific `HOSTCFLAGS`/`HOSTLDFLAGS`, because busybox and u-boot
+both needed it. Every package in the tree — including packages that
+will never touch ncurses — inherited a method naming one specific
+dependency, and the version it picked was whichever install the
+filesystem happened to list first.
+
+The correct shape: an abstract `build_env(ver)` on `Package` that each
+package implements for itself (ncurses owns its own flags and may vary
+them by version), plus a generic `deps_build_env` that merges the
+published interfaces of a package's resolved dependencies. Consumers
+name no dependency; the base class knows no package.
+
+Ask before writing any helper: **which object owns this knowledge?** If
+the helper names a specific package, module or subsystem and lives
+somewhere generic, it belongs in the owner instead.
+
+## Boot time and runtime latency are non-negotiable
+
+Target: embedded systems with hard-realtime ambitions. Evaluate
+proposals against that future, not "it's educational today".
+
+**Boot time is sacred.** Anchor numbers under pure QEMU emulation
+(TCG, no KVM): full boot through the custom bootloader **under 100
+ms**; loaded with `-kernel` **under 50 ms**. Order-of-magnitude
+budget:
+
+- **100 ns to ~1 us**: free. Initialize a kcond, install an IRQ
+  handler, zero a struct at boot even if the resource isn't used
+  yet. Don't contort code with lazy-init / one-time CAS /
+  constructor-on-first-use to save a `kcond_init`.
+- **~10 us to ~1 ms**: prefer to defer, not a hard rule. If the
+  work is needed during boot anyway, just do it.
+- **>1 ms, especially seconds**: hard rejection. Do the work async
+  (kthread, worker job, lazy on first real use) or drop the
+  feature.
+
+Mistake-to-not-repeat: proposing a synchronous busy-wait for the
+RTC second edge in `init_system_time()` to get a precise
+`boot_timestamp` — would cost up to 1s of boot on the critical
+path, for a feature an async kthread already covers. Right shape:
+make the kthread simpler/faster (RTC UIE instead of polling), don't
+drag work into boot.
+
+Same principle for runtime hot paths (timer IRQ, scheduler tick,
+syscall entry/exit, context switch, IRQ handlers). Don't add work
+to a hot path to make a cold path cleaner.
+
+## Working with Git History
+
+**Check `docs/annotated-commit-history.txt` before `git log`/`show`/`blame`.**
+Plain-text, 80-col walk of every first-parent commit on master
+(~4,900 commits, March 2016+); each entry has the verbatim log
+header plus an "AI notes:" summary of the diff, large refactors
+grouped into arcs. Read via `less`, `/`-search for subsystem or
+hash. Falls through to raw git only when annotation is too shallow.
+
+`scripts/dev/claude/annotate_commits` builds and extends it
+(sub-commands: regen-list / meta-range / merges / merge-log /
+append / show-head / sha-meta).
+
+## Your Dedicated Tools Directory: `scripts/dev/claude/`
+
+Dedicated home for helper scripts I write for my own work. When a
+task needs many related shell ops (git plumbing, file scans, repeated
+pipelines), write a sub-command dispatcher here instead of one-shot
+commands — the user grants permission once for
+`Bash(scripts/dev/claude/<tool>:*)` and the workflow stays auditable.
+Canonical pattern: `scripts/dev/claude/annotate_commits`
+(argument-parsed sub-commands, single permission pattern, dev-only).
+
+## AI-generated plans and specs: `docs/plans/`
+
+Plans, designs, and feature specs I generate go in `docs/plans/` (kept for
+history). The root-level `docs/*.md` (contributing, building, scheduler, etc.)
+are the human-facing docs — keep them very readable and uncluttered; never drop
+an AI working document at `docs/` root.
+
+## Build Commands
+
+```bash
+# First-time per arch (i386 | riscv64 | x86_64)
+export ARCH=i386
+./scripts/build_toolchain                # cross-compiler toolchain
+./scripts/build_toolchain -s host_gtest  # unit test deps
+./scripts/build_toolchain {-l,-h}        # list / help
+
+# Configure (cmake_run forwards to cmake; runs from root or out-of-tree)
+./scripts/cmake_run                      # default debug, ARCH=i386
+./scripts/cmake_run -DRELEASE=1          # -O3
+./scripts/cmake_run -DDEBUG_CHECKS=0
+./scripts/cmake_run -DARCH={riscv64,x86_64}
+./scripts/cmake_run --contrib            # clang + -Wconversion + stress opts
+./scripts/cmake_run --gcov               # kernel + unit-test coverage
+./scripts/cmake_run --intr --gcov        # flags are independent + combinable
+./scripts/cmake_run -h                   # list cmake_run's own flags
+
+# Build (cmake_run auto-runs if needed)
+make             # one file at a time, good for debugging
+make -j          # parallel (don't use -j$(nproc))
+make gtests      # unit tests (needs gtest/gmock)
+make rem         # rebuild image only (drops fatpart + orion.img)
+
+# Out-of-tree
+mkdir build-dir && cd build-dir && /abs/path/scripts/cmake_run && make -j
+
+# All configs (slow, useful before push)
+./scripts/adv/gen_other_builds  # builds every scripts/build_generators/* config
+```
+
+**Build directories are disposable.** `build/`, any out-of-tree `build-*`,
+and per-arch build trees are regenerable artifacts — delete, recreate, or
+reconfigure them freely (e.g. for a throwaway cross-config build). Nothing
+of value is lost: only build output that `cmake_run` + `make` reproduce. No
+need to ask before clobbering or removing one.
+
+## Testing
+
+Four test types: unit (gtest, host), selftest (in-kernel), shellcmd
+(syscall-based), interactive (`--intr` build).
+
+```bash
+# Unit tests (host, needs gtest/gmock) -- ~2s, 10s timeout is plenty
+./build/gtests
+./build/gtests --gtest_filter=kmalloc_test.*
+./build/gtests --gtest_list_tests
+
+# Test runner (boots QEMU for VM types; needs KVM)
+./build/st/run_all_tests             # one VM per test
+./build/st/run_all_tests -c          # single VM -- ~46s, 60s timeout
+
+# By type (-T prefix-matched: 'u'=unit, 'se'=selftest, 'sh'=shellcmd)
+./build/st/run_all_tests -T unit                # host, no VM/KVM -- ~24s
+./build/st/run_all_tests -T unit -c             # all in one gtests run
+./build/st/run_all_tests -T selftest
+./build/st/run_all_tests -T shellcmd [-c]
+./build/st/run_all_tests -T interactive
+./build/st/run_all_tests -T shellcmd -l         # list
+./build/st/run_all_tests -T shellcmd -f <regex> # filter
+```
+
+Unit tests (the `gtests` binary) are folded into the runner as a 4th
+type: it parses `gtests --gtest_list_tests`, collapses each parametric
+suite to one entry, and treats `DISABLED_` tests as `<manual>` (listed,
+run only with `-a`). A unit test runs on the host, so `-T unit` skips
+the KVM probe entirely.
+
+**Calibrate timeouts to these numbers.** If a run goes 2-3x over,
+something is hung (infinite loop, deadlock, lost wakeup); kill and
+investigate rather than extending the timeout.
+
+### Calling kernel `static` functions from gtests: the `STATIC` pattern
+
+`static` blocks gtests from linking; redeclaring the function in the
+test file as `extern` works but rots silently when the signature
+changes. Project idiom (see `include/tilck/kernel/test/README` and
+`include/tilck/common/basic_defs.h`):
+
+- C source uses the `STATIC` macro instead of `static`. It expands
+  to `static` in real builds and to nothing under
+  `UNIT_TEST_ENVIRONMENT`.
+- Declarations live in a dedicated test header
+  `include/tilck/kernel/test/<file>.h`, written with the same
+  `STATIC` keyword.
+- Both the kernel C source AND the gtest `#include` that test
+  header. A signature drift breaks the build at one of the two
+  sites.
+
+Examples to copy: `kernel/mm/system_mmap.c` +
+`include/tilck/kernel/test/mem_regions.h` (called from
+`tests/unit/mem_regions.cpp`); `kernel/fork.c` +
+`include/tilck/kernel/test/fork.h` (called from
+`tests/unit/fork_test.cpp`).
+
+Never `extern`-redeclare a kernel `static` in a `.cpp` test file.
+
+### Keep kernel code untouched when adding tests
+
+**Avoid `#ifdef UNIT_TEST_ENVIRONMENT` in production kernel code.** It
+is ugly and erodes the readability of the real implementation. When a
+test needs the kernel to behave differently, provide a fake on the
+test side instead. Pretty production code matters.
+
+Three mechanisms, in order of preference:
+
+1. **Upgrade a test stub.** If a helper the production code calls
+   already has a no-op / NULL-returning stub in
+   `tests/unit/generic_stubs.c` / `mm_fakes.cpp` / `misc_fake.c`,
+   strengthen the stub to a real fake. Zero kernel changes. Used
+   for `hi_vmem_reserve` / `hi_vmem_release` (real malloc fakes in
+   `mm_fakes.cpp`) so `alloc_kernel_isolated_stack` works as-is
+   in gtests.
+2. **Override via `__wrap_*`.** For a kernel function whose body
+   you want to replace entirely, add the symbol to
+   `other/cmake/wrapped_syms.cmake` and define `__wrap_<symbol>` in
+   a test fakes file. Production calls get linker-redirected to the
+   wrap. Requires the kernel symbol to be non-`static` (use the
+   `STATIC` macro so it stays `static` in real builds).
+3. **`STATIC` + test header.** When tests need to *call* a kernel
+   function directly (not replace it), use the STATIC + test-header
+   pattern documented above.
+
+What you should NOT do: gate kernel branches on
+`UNIT_TEST_ENVIRONMENT`, replicate kernel logic in a wrapper, or
+re-implement large kernel pieces inside tests. The kernel is the
+source of truth; tests sit beside it.
+
+### Portability: target archs vs host archs
+
+Don't confuse the two. **Target arches** (what Orion cross-compiles
+for): i386 (primary), riscv64, x86_64 today; **aarch64 is a planned
+future first-class target** and other arches (eg. RISC-V variants)
+may follow. **Host arches** (where gtests / build tools run): Linux
+x86_64 and aarch64; FreeBSD x86_64 (aarch64 future); Darwin aarch64
+only.
+
+Implications for test infrastructure and any header gated on the
+host compiler's arch predefines:
+
+- Never gate test-only code on `__aarch64__` alone. gtests are
+  built on x86_64 hosts too — code in an `#elif defined(__aarch64__)`
+  branch is invisible to them.
+- Conversely, never assume "aarch64 = test-only". aarch64 will be a
+  real Orion target; the existing aarch64 test stubs in
+  `include/tilck/kernel/hal.h` are gated on
+  `__aarch64__ && UNIT_TEST_ENVIRONMENT`, not on `__aarch64__`
+  alone, and that pattern is load-bearing.
+- Cross-arch test stubs (anything not specific to one arch's
+  hardware) belong in a `#ifdef UNIT_TEST_ENVIRONMENT` block placed
+  after the arch dispatch — typically end of `hal.h`. The
+  arch-specific headers (`common/arch/<arch>/*.h`) should skip
+  their production definition of the same symbol under
+  `UNIT_TEST_ENVIRONMENT`, so the cross-arch version wins
+  uniformly. Pattern in place for IRQ-state primitives
+  (`disable_interrupts`, `enable_interrupts`,
+  `are_interrupts_enabled`, etc.): production defs in
+  `include/tilck/common/arch/{generic_x86,riscv}/*_utils.h` under
+  `#ifndef UNIT_TEST_ENVIRONMENT`; test versions in `hal.h` under
+  `#ifdef UNIT_TEST_ENVIRONMENT`.
+
+When in doubt: portable test code is gated on
+`UNIT_TEST_ENVIRONMENT`, not on a specific arch predefine.
+
+## Fast iteration loop under QEMU (Darwin)
+
+Interactive bootloader + framebuffer is too slow for tight cycles
+and awkward to drive over `tmux send-keys`. Use headless text mode +
+`-kernel` direct boot + tmux:
+
+```bash
+# Configure (once)
+./scripts/cmake_run -DBOOT_INTERACTIVE=0 -DMOD_fb=0
+make -j
+
+# Run (anything after the script name → qemu-system-i386;
+# -append sets kopts: -sercon, -pk, -selftest <name>, -ttys 4)
+bash build/run_multiboot_qemu -display curses
+bash build/run_multiboot_qemu -display curses -append "-sercon"
+
+# Drive from tmux (boot → prompt in seconds)
+tmux new-session -d -s orion -x 100 -y 35
+tmux send-keys -t orion "bash build/run_multiboot_qemu -display curses" Enter
+until tmux capture-pane -t orion -p | grep -q 'root@orion:/#'; do sleep 1; done
+tmux send-keys -t orion "<command>" Enter
+tmux capture-pane -t orion:0 -p
+```
+
+`run_multiboot_qemu` passes the kernel via `-kernel`, skipping the
+Orion bootloader. `BOOT_INTERACTIVE=0` auto-boots; `MOD_fb=0` keeps
+VGA text mode (what `-display curses` renders into tmux).
+
+Second-TTY tests (e.g. tracer on tty1 + victim shell on tty2): user
+switches via `Alt-F1`/`Alt-F2`; from tmux send via
+`tmux send-keys M-F2`. Alternative: real QEMU window for video +
+serial tty for the second session.
+
+`tmux send-keys -l "<text>"` sends literal text (needed for args
+starting with `-`); `tmux send-keys "<key>"` sends keys (`Enter`,
+`BSpace`, `M-F2`, `C-c`).
+
+## Architecture
+
+```
+kernel/           Main kernel code
+  arch/           Architecture-specific (i386, x86_64, riscv64, generic_x86)
+  fs/             Filesystems (ramfs, vfs, devfs, fat32)
+  mm/             Memory management
+  tty/            Terminal
+  kmalloc/        Heap allocator
+modules/          Kernel modules/drivers (acpi, console, fb, kb8042, pci, serial, etc.)
+common/           Architecture-independent shared code
+boot/             Bootloader (BIOS + UEFI)
+include/tilck/    Orion headers (kernel/, common/ subsystem headers)
+userapps/         User-space apps (devshell test runner, etc.)
+tests/
+  unit/           C++ unit tests (Google Test)
+  system/cmds/    System test commands (shellcmds)
+  self/           Kernel self-tests
+  runners/        Python test infrastructure
+scripts/          Build automation (build_toolchain, cmake_run, etc.)
+  pkgmgr/         Ruby package manager (see docs/package_manager.md)
+  pkgmgr/tests/   Package manager test suite (700+ unit + system tests)
+other/cmake/      CMake build modules
+toolchain5/       Generated cross-compiler toolchain (not in repo)
+```
+
+`build/` artifacts: `orion` / `orion_unstripped`, `orion.img`,
+`fatpart`, `gtests`, `st/run_all_tests`, `run_qemu`.
+
+## Toolchain Management
+
+Ruby pkgmgr at `scripts/pkgmgr/`, installed into `toolchain5/`.
+Entry: `./scripts/build_toolchain` (bootstraps Ruby ≥3.2, execs
+`pkgmgr/main.rb`). The directory name is in `other/toolchain_conf`,
+read by everyone who needs it — never spell it out again.
+
+**For non-trivial pkgmgr work, read `docs/package_manager.md` first**
+(authoritative on the layout, the host tiers, dependency resolution,
+build identity, atomic installs, resumable downloads, `-C`
+reconfigure, adding packages, the 700+ test suite). This section is
+only the bare minimum.
+
+```bash
+./scripts/build_toolchain                 # default set for current ARCH
+./scripts/build_toolchain -l              # list pkgs + install status
+./scripts/build_toolchain -s <pkg>        # install one pkg
+./scripts/build_toolchain -u <pkg>        # uninstall one pkg
+./scripts/build_toolchain -S <arch>       # install cross-cc for arch
+./scripts/build_toolchain -U <arch>       # uninstall cross-cc for arch
+./scripts/build_toolchain -C <pkg>        # reconfigure (e.g. busybox)
+./scripts/build_toolchain --upgrade       # install new versions after bump
+./scripts/build_toolchain --check-for-updates  # 0=ok, 2=needs upgrade/rebuild
+./scripts/build_toolchain --print-layout  # where installed packages live
+./scripts/build_toolchain -d              # dry-run
+./scripts/build_toolchain -t [--coverage] # pkgmgr's own tests
+./scripts/build_toolchain --clean         # remove everything except the
+                                          # prebuilt cross-compilers, the
+                                          # bootstrap Ruby and the cache
+./scripts/build_toolchain -u ALL -f -a ALL -c ALL   # ...compilers too
+./scripts/build_toolchain -s ALL --with-host-packages  # + the host world:
+                                          # the default QEMU and the one
+                                          # stack it is built by
+```
+
+**Build parallelism is bounded, not unlimited.** `-j` with no number
+means as many jobs as the graph allows, which GCC and QEMU will take
+into the hundreds. `BuildJobs.compute` (`early_logic.rb`) picks the
+lower of two ceilings — a sixth of the cores left free, and 4 GB of
+RAM per job out of five sixths of the machine — so a 24-core / 94 GB
+box gets `-j19`. `BUILD_PAR=<n>` overrides it. Recipes that are
+deliberately serial (tcc) simply do not mention `$PAR`.
+
+Versions live in two unrelated files: `other/pkg_versions`
+(`VER_<PKG>`, target side, what ends up in Orion) and
+`other/host_pkg_versions` (`HOST_VER_<PKG>`, build-host tools). A
+package on both sides — ncurses — has an entry in each and they may
+differ freely; `get_config_ver(name, host:)` takes the side
+explicitly. Bump a version + `--upgrade` installs alongside the old
+one, but only for installs that used the default version: one asked
+for by name (`-s pkg:ver`, recorded as `origin:` in `.install`) is left
+alone. CMake detects stale at configure (both files are
+`CMAKE_CONFIGURE_DEPENDS`).
+
+Every file the cache holds is pinned in a third file,
+`other/pkg_hashes`: `<cache filename>: sha256:<64 hex>` for a file
+downloaded as it is, `<cache filename>: git:<40 hex>` for a source we
+clone and pack (the commit, never the archive's digest). A new package
+or version fails `test_lint_sources.rb` until its line is added; the
+first fetch prints the line. Never compute a pin from a file already in
+the cache and paste it: take the upstream's published sum, or let the
+tool download fresh and print it.
+
+`-s`, `-u` and `-C` all take `PKG[:VER]`. A `dep_list` entry can pin
+an exact version — `Dep('host_x', true, ver: Ver('1.2'))` — for host
+packages only; the target side is one version per package. An
+explicit pin beats a default (reported at info level); two pins that
+disagree are an error naming both paths.
+
+Layout — three coordinates, always, each with a fixed meaning:
+```
+toolchain5/<machine>/<env>/<stack>/{ sysroot/, pkgs/<pkg>/<ver>/ }
+
+  <machine>  where it RUNS      linux-x86_64, tilck-i386, noarch
+  <env>      what the machine must already provide, or the BOARD
+             for an Orion target                any, ubuntu-22.04, pc,
+                                               qemu-virt, licheerv-nano
+  <stack>    which build env made it           any, gcc-14.4.0
+
+toolchain5/
+  cache/                                  # tarballs (survive --clean)
+  staging/                                # in-progress (atomic install)
+  linux-x86_64/any/any/                   # static: musl cross-cc, blobs
+  linux-x86_64/any/gcc-14.4.0/            # our stack + its sysroot/
+  linux-x86_64/ubuntu-22.04/any/          # distro libc (ruby, mtools, mconf)
+  linux-x86_64/ubuntu-22.04/gcc-11.4.0/   # + host C++ ABI (gtest)
+  noarch/any/any/                         # acpica, gnuefi_src, lcov, libmusl
+  tilck-i386/pc/gcc-13.3.0/               # target pkgs, per arch AND board
+  tilck-riscv64/qemu-virt/gcc-13.3.0/
+```
+A package name appears only under `pkgs/`, so it can never be read as
+structure. **New axes become VALUES, never LEVELS** — a fourth level
+puts us back where toolchain4 ended up, with `gcc-*` meaning four
+different things depending on its depth.
+
+Two boards of one arch are two separate trees. Anything that
+identifies an installation must compare `Coords`
+(`scripts/pkgmgr/coords.rb`), never re-derive part of the path:
+matching on (version, compiler, arch) let one board's build answer
+for another, and `-s ALL` for the second board installed nothing.
+
+Key concepts:
+- `Package` base class (`scripts/pkgmgr/package.rb`): every pkg
+  inherits + `pkgmgr.register(...)` at load. Key methods:
+  `initialize`, `install_impl_internal`, `expected_files`,
+  optionally `config_impl` (for `-C`).
+- `SourceRef` (`scripts/pkgmgr/source_ref.rb`): decouples upstream
+  fetch from pkg def — N pkgs can share one tarball. Example:
+  `GNUEFI_SOURCE` → `gnuefi_src` (noarch) + `gnuefi` (arch built).
+- `host_tier`: `:portable` / `:stack` / `:distro` / `:compiler` —
+  selects the `<env>`/`<stack>` a host pkg installs into (table in
+  `docs/package_manager.md`).
+- **Build identity**: each install records what it was built FROM in
+  `.build_inputs` (recipe digest + patch digests).
+  `--check-for-updates` reports `ok` / `changed` / `unknown`, and
+  CMake refuses to build when anything is stale. A recipe is only a
+  recipe AT some coordinates — a build step naming
+  `#{default_arch.gcc_tc}-linux-ar` differs per arch — so records are
+  written and checked per install, and the digest must depend on the
+  sources and nothing else (never on `Dir.pwd`).
+- CMake never builds toolchain paths: it asks `--print-layout`.
+  `Coords` is the only thing that knows what a path looks like.
+
+## FreeBSD Build Host
+
+Supported alongside Linux. Differences:
+
+- **System compiler**: `cc`/`c++` are clang; project uses GCC from
+  ports. For host tools (gtest), pass
+  `-DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++` explicitly.
+- **GNU tools**: FreeBSD ships BSD userland. Build prepends
+  `scripts/gnu-wrap/` to PATH (redirects `tar`/`make`/`sed` → `gtar`
+  /`gmake`/`gsed`). System pkgs in
+  `scripts/bash_includes/install_pkgs` (`install_freebsd`), incl.
+  many `rubygem-*` that are bundled with Ruby on Linux.
+- **gtests**: built with HOST cc, not cross. Shim headers in
+  `include/system_headers/` bridge Linux ↔ FreeBSD/macOS (signals,
+  errno, clock ids, syscall numbers, dirent, termios). Build
+  failure with type conflict / missing constant → fix usually goes
+  in a shim.
+- **Cross-compile configure scripts**: `--host` alone makes autoconf
+  set `cross_compiling=maybe` and try to exec the cross-compiled
+  binary (triggers "ELF binary type '0' not known"). Always pass
+  both `--host` AND `--build` to force `cross_compiling=yes`. Set
+  `BUILD_CC=cc` for pkgs with host-side helpers (ncurses etc.)
+  else `BUILD_CC` defaults to `$CC` (cross).
+- **Bash shebang**: `#!/usr/bin/env bash`, not `#!/bin/bash`
+  (FreeBSD bash is at `/usr/local/bin/bash`).
+
+## Coding Style
+
+**Style matters as much as functionality.** The user rejects a diff
+that solves the problem but breaks formatting. Style audit is part
+of "done", not polish.
+
+### Workflow before writing C
+
+1. Read `docs/contributing.md` end-to-end (authoritative; summary
+   below is a digest, not a substitute).
+2. Sample recent kernel files (`kernel/poll.c`, `execve.c`,
+   `sched.c`, `exit.c`, `elf.c`) — they reflect current style.
+   Older files have legacy drift; emulate the newer ones.
+3. After drafting, grep your patterns against `kernel/*.c`. Patterns
+   absent from the kernel are probably wrong, even if they compile.
+4. **After editing ANY C/H file, run the full style_check sequence
+   before committing. NO EXCEPTIONS.**
+   ```
+   style_check check <files>           # fix all violations
+   style_check check --diff <files>    # apply mechanical fixes
+   style_check check --gradient --summary <files>  # review prettiness
+   ```
+   Iterate until zero violations. Apply the tool's `--diff` output
+   first; only attempt manual fixes when the tool has no auto-fix.
+   If a rule seems wrong, STOP and ask — show the snippet and the
+   error. Fixing one rule routinely breaks another (e.g. shortening
+   a type name breaks backslash alignment), so the full re-check
+   after every edit is non-negotiable.
+5. **For cols_80 violations (1-3 chars over):** before wrapping the
+   line, exhaust these cheaper fixes: remove optional spaces
+   around `+`/`-` in pointer arithmetic (`buf+OFFSET`), use
+   compact comma form (`,arg` instead of `, arg`), shorten a
+   trailing comment, move `{` to its own line. Only wrap the line
+   when none of these recover enough columns.
+
+### Summary of explicit rules (from contributing.md)
+
+- **3 spaces** indentation (not tabs)
+- **80 columns** strict line limit (no exceptions).
+  **Fixing an over-80-col line is NOT just breaking the line.**
+  When a line is part of a columnar pattern (macro tables, aligned
+  `#define` blocks, column-aligned call clusters), breaking that
+  one line destroys the visual pattern. Instead: reduce the padding
+  for the ENTIRE block so all entries stay aligned and fit in 80
+  cols. Only when padding reduction can't work (a single field is
+  inherently too long) should you consider renaming or refactoring.
+  Always look at the surrounding context before touching a long line.
+  When reducing padding, do the **minimal reduction necessary** —
+  just enough to fit in 80 cols. Don't collapse padding to the
+  minimum; the original generous padding was intentional.
+- **snake_case** everywhere
+- Opening brace on same line for control flow, **new line for
+  functions and array initializers**
+- Multi-line `if` conditions: opening brace on its own line
+- Omit braces for single-statement blocks unless confusing
+- Null checks without NULL: `if (ptr)` / `if (!ptr)`
+- Long function signatures: return type on previous line, args aligned
+- Long function calls: args aligned to opening paren
+- Struct init: `*ctx = (struct foo) { .field = val };`
+- `#define` values column-aligned
+- Comments: `/* ... */` style, multi-line with ` * ` prefix per line
+- Add blank line after `if (...) {` / `for (...) {` when the header
+  is **longer** than the body's first line (prevents the "hiding"
+  effect). When the header is shorter, no blank line — body extends
+  past the header anyway.
+- Nested `#ifdef` blocks are indented when small in scope
+
+### Additional rules inferred from reading kernel/
+
+Not in `contributing.md`, equally enforced. Skipping any of these
+gets the diff rejected.
+
+- **`sizeof(X)` always**, never `sizeof X`. Even for single
+  identifiers. Verify: `grep -nE 'sizeof [a-z]' kernel/` returns
+  only `(ssize_t)sizeof(...)` casts.
+- **Empty loop body: `{ }`, never `;`.** `while (cond) { }` on one
+  line. Bare `;` as loop body is rejected. The `{ }` stays on the
+  same line as the header when the header fits; never on its own
+  line below. Multi-line body only when header itself wraps.
+  **Generalization:** avoid empty statements anywhere — labels
+  inside lock-scope blocks must go AFTER the closing brace, not as
+  `out:;` inside:
+  `disable_interrupts(); { ... goto out; ... } out: enable_interrupts();`.
+- **Non-const locals at top of block** (pre-C99). Hard rule for any
+  mutable local: declare at top of enclosing block (function body,
+  lock-scope `{ ... }`, branch arm, loop body). Loop induction in
+  `for (int i = ...; ...)` is the exception. Use a bare `{ ... }`
+  sub-block to narrow temp scope:
+  ```c
+  void foo(void)
+  {
+     int a, b;
+     ...
+     {
+        int temp = compute_thing();
+        ... uses temp ...
+     }
+  }
+  ```
+  `const` locals are softer: mid-function const computed from in-flight
+  state is fine (and often preferred over a forward-declared mutable
+  written once); trivially-static const should go at the top.
+- **Semantic grouping of statements.** After the declaration block,
+  group related statements together and separate groups with blank
+  lines. In particular: an assignment and its error check belong
+  in the same group (no blank line between them); an ASSERT
+  validating a parameter belongs with the code that uses that
+  parameter, not isolated between two blank lines. When moving
+  declarations to the top of a block, don't let the blank-line-
+  after-decls rule break existing semantic groups — tighten the
+  groups instead.
+  ```c
+  /* Good: assignment grouped with its error check,
+   * ASSERT grouped with the setup it guards */
+  int rc;
+  struct termios saved = t->c_term;
+
+  rc = copy_from_user(&t->c_term, argp, sizeof(struct termios));
+  if (rc < 0) {
+     t->c_term = saved;
+     return -EFAULT;
+  }
+  ```
+  ```c
+  /* Bad: copy_from_user isolated from its error check */
+  rc = copy_from_user(&t->c_term, argp, sizeof(struct termios));
+
+  if (rc < 0) {
+  ```
+- **No `(void)expr` casts.** Kernel never uses them. Reasons:
+  `-Wno-unused-parameter` is on (unused params don't warn); musl on
+  i386 doesn't `warn_unused_result` on `read`/`write`/`getpid`/...
+  (discarded syscall returns don't warn).
+- **Unused callback params: name `unused`**, not `_ctx`/`_param`. Refs:
+  `kernel/sched.c:idle`, `main.c:do_async_init`,
+  `datetime.c:clock_drift_adj`.
+- **One statement per line.** Don't pack `close(a); close(b);` on
+  one line.
+- **Static fn defs: type/modifiers on their own line** — uniformly,
+  even for short `static void idle(void *unused)`. (`contributing.md`
+  documents this only for long signatures; kernel applies it always.
+  See `kernel/poll.c`, `execve.c`.)
+- **`{` placement** depends on context:
+  - **Same line**: control flow w/ single-line condition (`if (x) {`).
+  - **Own line**: function bodies (always), array initializers,
+    multi-line `if` conditions where `)` is at the wrapped line's end
+    (see `kernel/elf.c` ELF header check), lock-scope blocks
+    (`disable_preemption(); { ... } enable_preemption();` —
+    `kernel/sched.c`, `execve.c`).
+- **Em-dashes in comments accepted.** Use where prose flows; don't
+  sprinkle. Examples in recent dp/tracer code, `kernel/poll.c`.
+
+### Multi-line call / declaration syntax (paren symmetry)
+
+Multi-line calls/decls must be visually symmetric. Two valid styles;
+the asymmetric hybrid is never valid.
+
+**Style 1 — aligned to opening paren.** Use when the opening
+expression leaves room for the first arg on the same line. Args
+sit under the first; `;` at end of last arg.
+```c
+very_long_expression(arg1,
+                     arg2,
+                     arg3);
+```
+
+**Style 2 — indented continuation, `);` on own line.** Use when
+style 1 doesn't fit. Open `(` ends the first line; args at +3
+indent; closing `);` on its own line, aligned with the wrapping
+statement.
+```c
+context_switch = asm_save_regs_and_schedule(
+   __builtin_extract_return_addr(__builtin_return_address(0))
+);
+```
+
+**Style 3 — NEVER.** Args indented but `);` at end of last arg —
+top-heavy, no closing-paren symmetry:
+```c
+this_is_a_long_expression(
+   arg, arg, arg);    /* WRONG */
+```
+
+**Cross-function uniformity.** When related calls/defs cluster on
+screen (wrapper inlines, setup calls, typedef columns), pick one
+style for the whole cluster. If any entry needs style 2, use
+style 2 for all entries — even those that could fit style 1.
+
+Same for column-aligned multi-line declarations (struct
+initializers, `typedef` lists, `#define` blocks): pad so trailing
+columns (`;`, `}`, `=`) land at the same column. Pretty > compact.
+
+### Multi-line control-flow conditions
+
+When an `if`/`while`/`for` condition spans multiple lines: body
+MUST be braced, `{` on its OWN line aligned with the keyword. Holds
+even for single-statement body (overrides the "omit braces" rule).
+
+```c
+if (this + is + a + very + long +
+    multi + line + expression)
+{
+   do_something();
+}
+```
+
+Never:
+```c
+if (cond +                          /* WRONG: { on cond line */
+    more) {
+   ...
+}
+if (cond +                          /* WRONG: brace-less w/ wrapped cond */
+    more)
+   do_something();
+```
+
+Reason: with a wrapped condition, a bare body statement is hard to
+tell from the next statement at the same indent.
+
+**Nested-if propagation**: when a nested `if` is in brace-on-own-line
+form, the outer `if` containing it MUST also use braces — its body
+spans multiple visual lines.
+
+**Brace-on-own-line is the fall-back.** Before using it, try to
+flatten the condition. Three alternatives, picked on context:
+
+```c
+/* (a) extract sub-expressions to named locals — best when 1-2 exprs */
+if (curr_state == TASK_STATE_RUNNING) {
+   const u64 curr_vruntime = atomic_load(&curr->ticks.vruntime);
+   const u64 selected_vruntime = atomic_load(&selected->ticks.vruntime);
+   if (curr_vruntime < selected_vruntime)
+      selected = curr;
+}
+
+/* (b) convenience pointer one level up — best when block reads
+ * multiple fields of the same nested struct */
+struct sched_ticks *const ct = &curr->ticks;
+struct sched_ticks *const st = &selected->ticks;
+if (atomic_load(&ct->vruntime) < atomic_load(&st->vruntime))
+   selected = curr;
+
+/* (c) accept brace-on-own-line — when factoring just rearranges ugliness */
+```
+
+Don't over-extract: a wall of `const u64 x = ...;` is noise. Storing
+every leaf as a local is noise; a pointer one level up usually wins.
+
+**Naming locals**: descriptive over abbreviated.
+`pos_vruntime < selected_vruntime` reads like prose. When 80 cols
+forces shorter, fall-back ladder:
+1. Mildly abbreviate the modifier, keep the noun (`selected_vruntime`
+   → `sel_vruntime`).
+2. Drop `const` from BOTH statements for symmetry (never one const
+   and one not).
+3. Last resort: short names (`pos_vr`/`sel_vr`).
+
+Never break the assignment statement itself as the fall-back —
+broken assignment costs more readability than the const-drop or
+abbreviation.
+
+### Reference files to consult
+
+| Pattern | Look at |
+|---------|---------|
+| Static fn defs + multi-arg alignment | `kernel/poll.c`, `kernel/execve.c` |
+| Lock-scope `{ ... }` blocks | `kernel/sched.c`, `kernel/execve.c` |
+| Multi-line `if` with brace-on-own-line | `kernel/elf.c` (`e_ident` validation) |
+| Struct init with designators | `kernel/sched.c` (`create_pid_visit_ctx`) |
+| Userspace static fn style | `userapps/tracer/screen_tracing.c`, `userapps/dp/dp_main.c` |
+| Comment header for a non-trivial file | the prologues of any of the above |
+
+## Cross-config and cross-arch pitfalls
+
+Default local build (`gcc` + `DEBUG_CHECKS=1` + `KRN_HANG_DETECTION=0`
++ i386) hides bugs that CI catches. Before declaring done, run one
+release + UBSAN config and one riscv64 build:
+
+```bash
+CMAKE_ARGS='-DKERNEL_UBSAN=1 -DKRN_HANG_DETECTION=1 -DKRN_MINIMAL_TIME_SLICE=1' \
+   ./scripts/build_generators/gcc_rel && make -j
+CMAKE_ARGS='-DARCH=riscv64 -DKERNEL_UBSAN=1 -DKRN_HANG_DETECTION=1 -DKRN_MINIMAL_TIME_SLICE=1' \
+   ./scripts/build_generators/gcc     && make -j
+```
+
+Full sweep: `./scripts/adv/gen_other_builds`. CI flags layered on
+i386/riscv64 (`.github/workflows/ci-{i386,riscv64}.yml`):
+`KERNEL_UBSAN`, `KRN_HANG_DETECTION`, `KRN_MINIMAL_TIME_SLICE`,
+`KRN_RESCHED_ENABLE_PREEMPT`, `TIMER_HZ=500`,
+`KRN_KMALLOC_FREE_MEM_POISONING`. Matrix includes release configs
+with `DEBUG_CHECKS=0`.
+
+**Code under feature flags** (`#if KRN_HANG_DETECTION`, etc.) is
+invisible to the default build. If touching such a block, set the
+flag before building.
+
+**Macros that may expand to nothing.** `ASSERT()`, `ASSERT_TASK_STATE()`,
+`ASSERT_CURR_TASK_STATE()` become `do {} while(0)` under
+`DEBUG_CHECKS=0`. Brace-less `if (x) ASSERT(...)` then trips
+`-Werror=empty-body` in release builds. Always brace-wrap.
+
+**Debug-only code: prefer `if (DEBUG_CHECKS) { ... }`.** `DEBUG_CHECKS`
+is a literal 0/1 macro, so the compiler dead-code-eliminates the dead
+branch — release builds are identical to ones that never had the
+block, and the source has no conditional-compilation noise. Use this
+whenever the debug-only code consists only of statements:
+
+```c
+if (DEBUG_CHECKS) {
+   verify_invariant(thing);
+   trace_log("foo");
+}
+```
+
+When the code requires a debug-only *declaration* (e.g. a local whose
+only uses are inside `ASSERT`s), `if (DEBUG_CHECKS)` stops working —
+the decl is visible in both branches and `-Werror=unused-variable`
+breaks the release build. Use `DEBUG_ONLY(decl)` there. It is a
+necessary evil, not a preferred form: don't reach for it when the
+plain `if (DEBUG_CHECKS)` form fits.
+
+```c
+DEBUG_ONLY(enum task_state state = atomic_load(&ti->state));
+ASSERT(state != TASK_STATE_ZOMBIE);
+ASSERT(state == TASK_STATE_RUNNING || state == TASK_STATE_RUNNABLE);
+```
+
+**A whole debug-only function: guard the body with `if (!DEBUG_CHECKS)`,
+don't wrap the function in `#if`.** A selftest or helper that only makes
+sense under debug checks should bail at the top, not vanish behind a
+preprocessor block — the function stays compiled and type-checked in
+release while its body dead-code-eliminates:
+
+```c
+void selftest_cow_oom(void)
+{
+   if (!DEBUG_CHECKS) {
+      printk("cow_oom: needs DEBUG_CHECKS=1\n");
+      se_regular_end();
+      return;
+   }
+   ... real test, freely using debug-only hooks ...
+}
+```
+
+**Debug-only state shared across translation units: a `static` + a
+setter, never an `extern` under `#if`.** Keep the storage `static` (with
+the hot-path check written `if (DEBUG_CHECKS && the_static && ...)`) and
+expose an always-declared setter whose body is itself `if (DEBUG_CHECKS)`-
+gated. No `#if`, no exported variable; all of it dead-code-eliminates in
+release. The `if (DEBUG_CHECKS && the_static)` reference counts as a *use*,
+so the `static` does not trip `-Werror=unused-variable` (same reason the
+`if (DEBUG_CHECKS) { use(x); }` form is warning-free — unlike `ASSERT`,
+which removes its argument). Pattern in `kernel/kmalloc/kmalloc.c`
+(`kmalloc_inject_fail_next` + `debug_kmalloc_inject_fail_next()`):
+
+```c
+/* kmalloc.c */
+static bool kmalloc_inject_fail_next;
+void debug_kmalloc_inject_fail_next(void)
+{
+   if (DEBUG_CHECKS)
+      kmalloc_inject_fail_next = true;
+}
+/* general_kmalloc(), hot path: */
+if (DEBUG_CHECKS && kmalloc_inject_fail_next && *size >= PAGE_SIZE) { ... }
+/* kmalloc.h: just `void debug_kmalloc_inject_fail_next(void);` */
+```
+
+`#ifdef DEBUG_CHECKS ... #endif` only when neither form fits
+(debug-only struct fields, debug-only header includes). **Do not use
+`IS_RELEASE_BUILD` as a debug gate — `DEBUG_CHECKS` is the canonical
+macro for this.**
+
+**Strict-alignment types propagate.** A struct embedding `atomic_u64_t`
+/ `atomic_s64_t` (anything `ALIGNED_AT(8)`) inherits 8-byte alignment
+recursively. Intrusive `list_for_each` produces a sentinel
+`container_of(&head, struct task, ...)` whose value doesn't satisfy
+that alignment even though the underlying memory access is sound.
+`-fsanitize=alignment` (on in i386/riscv64 UBSAN builds) fires on
+`&pos->member` of the sentinel. Mitigation lives in
+`include/tilck/kernel/list.h`: `list_node_ptr_of()` routes through
+`(char *)pos + offsetof(...)` cast back via `TO_PTR()`. New list
+macros must follow the same pattern.
+
+**Cast-align.** riscv64 is strict; `(char *)x → (T *)` trips
+`-Werror=cast-align`. Bypass via `TO_PTR(x)` (preferred for
+integer-shaped values, idiomatic across the kernel) or
+`(T *)(void *)x` (pointer-to-pointer). `(T *)(char *)x` is broken on
+riscv64. Never `(void)expr` to discard a `warn_unused_result` return
+— check it and act.
+
+**Integer narrowing.** `-Wconversion` / `-Wshorten-64-to-32` are on
+under `--contrib` and parts of CI. Explicit cast on the value being
+narrowed. timespec / size_t→int conversions are the common offenders;
+pattern in `kernel/fs/fs_syscalls.c` (explicit cast + comment on the
+assumption).
+
+**WEAK fallbacks in selftests.** `kernel/misc.c` carries WEAK stubs
+returning false / no-op for arch-absent features (e.g.
+`rtc_wait_for_second_edge` on riscv64). A selftest that calls into
+such an API must probe + skip on the first call; otherwise it hangs
+on a signal that never arrives until the per-test timeout fires.
+Canonical pattern: `tests/self/se_rtc_uie.c`.
+
+## Porting expectations
+
+Porting (kernel→userspace, framework A→B, lang A→B, etc.) requires
+**feature parity AND visual fidelity** — every keybinding, menu,
+color, modal flow, interaction. MVP-grade "covers the main features"
+gets rejected as a regression.
+
+Workflow:
+
+1. **Read the original exhaustively first.** Walk every source file,
+   list every key, menu, non-obvious code path. Save as spec
+   (`docs/<thing>-feature-spec.md`) — survives the conversation,
+   serves as a reviewable checklist.
+2. **Boot the original.** Walk every UI path, capture transcripts
+   for later diff.
+3. **Track the gap explicitly.** Append a "gap list" to the spec;
+   tick items as closed. User wants the list at zero before done.
+4. **Reuse logic.** If original is mostly data-flow (metadata-driven
+   rendering, etc.), keep the code intact and change only the
+   output target. Keeps byte-identical results, avoids a metadata
+   mirror that drifts.
+5. **Diff at the end.** Both old and new in the same harness, capture
+   each screen, `diff`. Any non-runtime difference is a regression.
+
+User pointing out a missing feature = failure of step 1; pointing
+out a visual divergence = failure of step 5.
+
+## Commit Style
+Each commit must be self-contained, compile in all configs, and pass all tests
+(critical for `git bisect`).
+
+Keeping the series bisect-safe sometimes means folding a fix into the earlier
+commit that introduced a bug, rather than appending a "fixup". `git rebase -i`
+IS usable here: the harness's "interactive flags (`-i`) not supported" note only
+refers to the default editor-driven flow (which hangs waiting for an editor).
+Drive it non-interactively instead, with `GIT_SEQUENCE_EDITOR` (rewrites the
+rebase to-do: `pick`→`edit`/`reword`/`squash`) and `GIT_EDITOR` (supplies
+messages). To edit the commit that introduced a bug:
+
+```bash
+GIT_SEQUENCE_EDITOR='sed -i 1s/^pick/edit/' git rebase -i <bug-commit>~1
+#  ...fix the files, then:  git add -A && git commit --amend --no-edit
+GIT_EDITOR=true git rebase --continue
+```
+
+`GIT_EDITOR=true` accepts existing messages unchanged (use `--amend -F file` /
+`--no-edit` to set them). The same pattern unblocks any editor-driven git
+command (e.g. `git commit` without `-m`). Verified working in this environment.
+
+## Dry-run first, every time
+
+**Before any destructive action, run the tool's dry-run and read what
+it says it will do.** `-d` / `--dry-run` on the package manager, and
+the equivalent wherever else one exists. This is not optional and it
+is not a judgement call: if the command can remove or overwrite
+something and the tool supports asking first, ask first.
+
+```bash
+./scripts/build_toolchain -u host_qemu:6.2.0 -d   # what would go?
+./scripts/build_toolchain -u host_qemu:6.2.0      # ...then do it
+```
+
+**Why:** a destructive command that removes the wrong thing does not
+announce itself. `-u` removed installs from a second board for as
+long as this tree has had two boards; a forced rebuild removed a
+package and then failed, leaving nothing where something had been,
+and `--check-for-updates` reported the tree as healthy because a
+package that is simply GONE reads as "not installed" rather than
+"stale". In every one of those cases the dry run would have printed
+the paths a moment before they were destroyed, and the whole class of
+"what exactly did I just delete?" would never have come up.
+
+The package manager's dry-run is expected to be **complete**: every
+mode that writes must honour `-d`, and a dry run must not add, remove
+or modify a single file. That is enforced by
+`test_every_destructive_mode_touches_nothing_in_dry_run`, which
+fingerprints the whole toolchain before and after. A new mode that
+writes without honouring `-d` fails that test -- and if a gap is
+found, close the gap rather than working around it.
+
+## The package manager reads its inputs through their owners
+
+`ARCH` and `BOARD` are read in exactly three places: their
+definitions in `early_logic.rb`, the CLI boundary in `main.rb`, and
+`Scope.env` (`scripts/pkgmgr/scope.rb`), the one place the constants
+become a value. That value -- the arch and board being built for,
+the stack being built into -- is what every scoped question is
+answered under: `main.rb` builds one `Scope` from its options and
+hands it down, the planner takes it as an argument, and a package
+answers a scoped question (`coords`, `default_arch`, `installed?`,
+`build_steps`, ...) only once bound to one with `pkg.at(scope)`.
+Asked unbound, it raises `Package::Unbound`. There is no
+`pkgmgr.target_arch`, no `with_target_arch { }` and no scope ivar:
+nothing holds a scope, so nothing can be answered from the wrong
+one. Likewise the identity of an installation is its `Coords`;
+nothing selects installs by comparing `arch` or `compiler` on their
+own. What is installed is a `World` (`world.rb`), the tree scanned
+once per announced change; the planner takes that as an argument
+too, and `pkgmgr.world` is the one place the tree is read.
+
+`scripts/pkgmgr/tests/test_lint_ambient.rb` enforces this on every
+run, by parsing the sources. **A new allowlist entry needs a written
+reason, and it must name a method that exists** -- the test checks
+both. Do not add one to make the suite pass; ask the owner instead.
+
+**The sibling sweep.** When a bug is found in one reader of some
+shared state, every other reader of that state is checked before the
+fix is committed:
+
+```bash
+grep -n '\bBOARD\b' scripts/pkgmgr/*.rb     # sixty seconds
+```
+
+**Why:** every logic bug this package manager had was the same bug
+-- a question about one installation answered from ambient state --
+and each was fixed where it was found while its siblings stayed. The
+block that scoped an install's board learned about boards;
+`board_supported?`, four hundred lines away, kept reading the global
+and refused to rebuild the u-boot that `-f` had just deleted. The
+grep would have found it in the same minute. The scope became a
+value precisely so that this shape cannot be written any more; the
+sweep still applies to every other kind of shared state.
+
+**A pkgmgr logic bug is not fixed until its mutant dies.** The
+package manager's logic core is covered by three instruments, in
+this order of authority, and a fix touches all three:
+
+1. **The model** (`scripts/pkgmgr/tests/model/model.rb`) is the
+   contract. If the bug is a wrong answer, the model already says the
+   right one, or the model is wrong and is fixed first. Every
+   historical bug is a case in `test_model.rb`.
+2. **The exhaustive lane** (`-t --exhaustive`, minutes; sampled in
+   every `-t`) diffs the planner against the model over every world
+   of up to three installations, in memory: a case is a value, and
+   the two answers are compared. A bug it did not catch means a shape
+   or a command line is missing from `tests/exhaustive/domain.rb`:
+   add it, and the lane fails before the fix and passes after. What
+   the executor makes of a plan is judged on disk once per kind of
+   action (`tests/test_executor.rb`), and around every command line
+   the suite drives (the laws' L1_executor).
+3. **Mutation** (`-t --mutation`; `scripts/dev/claude/pmmutate run
+   --file F` for one file) must be able to *express* the bug as an
+   operator and the suite must kill it. If
+   no operator produces the bug, add one to
+   `tests/mutation/operators.rb`. The score to defend is zero
+   survivors in scope; an equivalent mutant is excused on its line
+   with `# mutation: equivalent -- <reason>`, never by shrinking the
+   scope.
+
+**Why:** a fix that only patches the site it was found at leaves the
+class alive. The model states the class, the lane finds every
+instance the domain can express, and the mutant proves the tests
+would notice a recurrence.
+
+## The toolchain tree lives at one absolute path
+
+`toolchain5/` cannot be moved, copied or mounted at another path and
+keep working, and this is a known, deliberate state -- not a bug to
+fix in passing. What is relative and what is not:
+
+- **Sysroot farms are relative** (`Sysroot.compose`, `sysroot.rb`):
+  every link under `<stack>/sysroot/` is a `../` walk to
+  `<stack>/pkgs/`, so the farms survive a move. A tree composed
+  before this is brought forward by any recomposition (every
+  uninstall recomposes all stacks).
+- **Every host-stack binary bakes two absolute paths.** GCC's specs
+  (`host_gcc.rb`, the `*link:` rewrite) put `DT_RPATH
+  <stack>/sysroot/usr/lib` and `PT_INTERP <stack>/sysroot/usr/lib/
+  ld-linux-x86-64.so.2` into everything built in a stack, and our
+  `ld.so` itself carries the sysroot as its compiled-in default
+  search path (glibc's `--prefix`). `RPATH` rather than `RUNPATH`
+  on purpose: it is searched before `LD_LIBRARY_PATH`, which is
+  what the portability audit relies on.
+- **Target packages (`tilck-*/`), `noarch/` and `cache/` bake
+  nothing** and can be copied freely.
+
+Sharing a tree between checkouts is the supported case:
+`TCROOT_PARENT` (`early_logic.rb`) points a checkout at a tree
+elsewhere; the tree does not move, the checkouts do.
+
+### Why not the system's `ld.so`, and why not `$ORIGIN` today
+
+Verified on this machine (system glibc 2.44, stacks glibc 2.41):
+`ld.so` and `libc.so.6` are two halves of one program bound by the
+versionless `GLIBC_PRIVATE` ABI -- our `libc.so.6` imports 325 such
+symbols from the loader, `_rtld_global` among them, a struct whose
+layout changes between releases. Every mismatched pairing failed:
+system loader + our libc segfaults (or exits silently, as QEMU
+did); our loader + system libc dies on
+`__pointer_chk_guard@GLIBC_PRIVATE`. The loader is the LEAST
+stable piece, not the most; it must be exactly its own libc's, and
+the stack exists precisely to not depend on the system's libc. So
+`PT_INTERP` must name our loader, and the ELF interpreter field
+has no `$ORIGIN`: the kernel resolves it before any userland runs.
+
+`$ORIGIN` RPATH for the libraries is possible but not from one
+spec line: `$ORIGIN` is relative to the *binary*, and stack
+binaries sit at five different depths inside their install
+(`bin/`, `usr/bin/`, `usr/lib/gconv/`, `usr/lib/gtk-3.0/3.0.0/
+immodules/`, ...), so one link-time RPATH cannot be right for all
+of them. Distros that ship relocatable trees rewrite per binary at
+install time.
+
+### The plan for a relocatable tree, when it is needed
+
+The tool that fixes the interpreter is the tool that makes
+`$ORIGIN` unnecessary: `patchelf` as a `:portable` host package,
+and a `--relocate` mode that walks `linux-*/` and sets, per ELF
+file, `PT_INTERP` and `DT_RPATH` to the new absolute path, then
+recomposes and re-runs the portability audit (which already
+accepts `$ORIGIN` refs, `portability.rb` `allowed_ref?`). A
+post-install `patchelf` pass writing `$ORIGIN/<depth>/../sysroot/
+usr/lib` per binary is the alternative hygiene step; it costs a
+rebuild of every host stack and should be batched with the next
+reason to rebuild them (the distro-env rule, item B of
+`docs/plans/pkgmgr-schema-longevity-review.md`). Neither is
+urgent; a moved tree is not a need today.
+
+## No changes without testing
+
+Never commit changes affecting build logic, package installs, or
+runtime behavior without exercising the affected path.
+
+- **pkgmgr unit tests** (`./scripts/build_toolchain -t`) use
+  `FakePackage` stubs — passing proves logic is sound, NOT that real
+  installs work.
+- **pkgmgr install changes**: `./scripts/build_toolchain -s <pkg>`
+  + check `expected_files` are actually produced.
+- **Multi-arch**: repeat with `-a <arch>` per arch, or
+  `--system-tests -a ALL`.
+- **Dep-graph changes**: `--deps <pkg>` to confirm tree, then
+  force-reinstall a dependent to check ordering.
+- **`config_impl` / interactive flows**: verify the host tool binary
+  links against the expected libs (`ldd`, `strings`, `V=1` build
+  logs).
+
+If a change is genuinely untestable in this environment (e.g. needs
+a real TTY), say so and ask for an exception rather than committing
+blind.
+
+### Package changes MUST be verified by RUNNING Orion, end to end
+
+A package that builds is not a package that works. **Change a package
+— its build, its flags, its patches, anything — and you must boot
+Orion and exercise what that package produces.** Not the build log,
+not `expected_files`, not "the binary is byte-identical": run it.
+
+TCC is the standing example, and it has failed at the last possible
+step more than once: it built cleanly, installed cleanly, ran on
+Orion, *compiled a program on Orion* — and the program it produced
+did not run. Everything up to the final `./ex1` looked perfect.
+
+So the test has to reach the END of the chain. For tcc that is
+`tests/system/scripts/tcc`, which compiles `ex1.c` **and executes the
+result and compares its output**:
+
+```sh
+tcc -static /lib/tcc-examples/ex1.c -o /tmp/ex1
+out=`./ex1`
+[ "$out" = "Hello World" ] || exit 1
+```
+
+**The trap: those tests are OFF by default and skip silently.** The
+`EXTRA_*` apps default to `OFF`, the scripts begin with
+
+```sh
+if ! [ -f /bin/tcc ]; then
+   echo "No TinyCC in /bin/tcc: skipping the test"
+   exit 0
+fi
+```
+
+and the runner then prints `[PASSED]`. A full green `run_all_tests`
+proves nothing about tcc unless tcc is in the image. Build it in and
+look at the output:
+
+```bash
+./scripts/cmake_run -DEXTRA_TCC=1 && make -j
+./build/st/run_all_tests -T shellcmd -f '^extra$' -o   # -o: show output
+```
+
+Do it for **every affected arch** — i386 and riscv64 behave
+differently, and a code generator is exactly the kind of package where
+that matters.
+
+## CI
+GitHub Actions tests all commits across i386, riscv64, x86_64 with
+debug/release builds, unit tests, system tests, and coverage
+(`.github/workflows/ci-{i386,riscv64,x86_64}.yml`). Six more workflows
+(`ci-tc-{arch,debian,fedora}-{i386,riscv64}.yml`) build the toolchain
+from scratch on a stock distro image, so they validate pkgmgr without
+depending on a prebuilt container.
+
+The kernel workflows skip `readme*`, `temp-*` and `exp-*` branches: on a
+topic branch they must be dispatched explicitly.

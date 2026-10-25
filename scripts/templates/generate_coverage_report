@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: BSD-2-Clause
+
+# If TEST_GCOV is empty/unset but TRAVIS/CIRCLECI is set, exit
+# In other words, the TEST_GCOV controls this script only if it is running
+# under TRAVIS or CIRCLECI, which makes sense.
+
+if [[ "$TRAVIS" != "" || "$CIRCLECI" != "" ]]; then
+   if [[ "$TEST_GCOV" == "" ]]; then
+      echo "Exit 0 without doing anything"
+      exit 0
+   fi
+fi
+
+set -e # exit if any command fails
+SRC="@PROJ_ROOT@"
+
+source $SRC/scripts/bash_includes/script_utils
+
+TC="@TCROOT@"
+BUILD="@BUILD_DIR@"
+
+HTML_DIR="@COVERAGE_HTML_DIR@"
+GCOV="@TOOL_GCOV@"
+
+LCOV_DIR="@LCOV_DIR@"
+LCOV="$LCOV_DIR/bin/lcov"
+GENHTML="$LCOV_DIR/bin/genhtml"
+
+function show_help {
+   echo "Usage:"
+   echo "      <no options>    collect coverage info from the *.gcda files "
+   echo "                      DISCARDING any previous coverage.info data, "
+   echo "                      producing a converage.info file"
+   echo
+   echo "      --clean         clean any coverage files previously generated "
+   echo "                      and exit"
+   echo
+   echo "      --acc           collect coverage info WITHOUT DISCARDING the"
+   echo "                      previous converage.info data, producing a new"
+   echo "                      converage.info file"
+   echo
+   echo "      --codecov       only upload the coverage data to CodeCov "
+   echo "                      assuming that 'coverage.info' exists"
+   echo
+   echo "      --gen           only generate html coverage output assuming that"
+   echo "                      the file 'converage.info' exists"
+   echo
+   echo "      --info          show configuration info"
+   echo "      --help          show this help message"
+}
+
+function show_config_info {
+   echo "GCOV:       $GCOV"
+   echo "LCOV:       $LCOV"
+   echo "GENHTML:    $GENHTML"
+   echo "BUILD_DIR:  $BUILD"
+   echo "HTML_DIR:   $HTML_DIR"
+}
+
+function gen_html_coverage {
+
+   if [ ! -f coverage.info ]; then
+      echo "ERROR: the file coverage.info does NOT exist."
+      exit 1
+   fi
+
+   # (Eventually) remove and create the output coverage directory
+   rm -rf "$HTML_DIR"; mkdir -p "$HTML_DIR"
+
+   # Generate the HTML coverage output
+   $GENHTML --output-directory "$HTML_DIR" coverage.info
+}
+
+function remove_gcda_files {
+   find . -type f -name '*.gcda' -print | xargs /bin/rm -f
+}
+
+function remove_all_lcov_files {
+   rm -f lcov.info coverage.info
+}
+
+echo "Entering in the build directory: '$BUILD'"
+cd "$BUILD"
+
+if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+   show_help
+   exit 0
+fi
+
+if [[ "$1" == "--info" ]]; then
+   show_config_info
+   exit 0
+fi
+
+if [[ "$1" == "--clean" ]]; then
+   remove_gcda_files
+   remove_all_lcov_files
+   exit 0
+fi
+
+echo "NOTE: Use '$GCOV' as gcov tool"
+
+if [[ "$1" == "--gen" ]]; then
+   gen_html_coverage
+   exit 0
+fi
+
+if [[ "$1" == "--codecov" ]]; then
+
+   if [ ! -f coverage.info ]; then
+      echo "ERROR: the file coverage.info does NOT exist."
+      exit 1
+   fi
+
+   # Make the SF: paths repo-relative. lcov records absolute build-host paths
+   # (/__w/tilck/tilck/kernel/x.c under CI); stripping the repo-root prefix lines
+   # them up with the repo-rooted file network the CLI builds at the upload step
+   # below.
+   sed "s#^SF:$SRC/#SF:#" coverage.info > coverage.info.tmp
+   mv coverage.info.tmp coverage.info
+
+   #
+   # Authentication: uploads use a CodeCov upload token, passed via the
+   # CODECOV_TOKEN env var (kept as a secret CI variable). We hand it to the
+   # CLI when it is set; if it is unset we still attempt a tokenless upload,
+   # which CodeCov allows for public repos only in limited cases (e.g. PRs from
+   # forks), so it may fail on a protected branch.
+   #
+   # In GitHub Actions, prefer the official 'codecov/codecov-action' (it wraps
+   # this same CLI); pass the token via 'token: ${{ secrets.CODECOV_TOKEN }}'.
+   # This script path is for local / manual uploads and for CI providers
+   # without a dedicated CodeCov integration.
+   #
+   # See: https://docs.codecov.com/docs/the-codecov-cli
+   #
+   token_arg=""
+   if [[ "$CODECOV_TOKEN" != "" ]]; then
+      token_arg="-t $CODECOV_TOKEN"
+   else
+      echo "NOTE: no CODECOV_TOKEN set; relying on tokenless upload"
+   fi
+
+   # We pass the report explicitly below (-f + --disable-search), but still drop
+   # the large *.gcda and the intermediate lcov.info to keep the tree tidy.
+   rm -f lcov.info
+   remove_gcda_files
+
+   # Download the Codecov CLI. It replaces the deprecated uploader that used to
+   # live at uploader.codecov.io; codecov/codecov-action wraps this same CLI.
+   if ! [ -d "$BUILD/tmp" ]; then
+      mkdir -p "$BUILD/tmp"
+   fi
+
+   pushd "$BUILD/tmp"
+
+   if ! [ -f codecov ]; then
+
+      curl -Os https://cli.codecov.io/latest/linux/codecov
+      if ! [ -f codecov ]; then
+         echo "ERROR: failed to download the Codecov CLI"
+         echo "Trying again in 1 minute..."
+         sleep 60
+
+         curl -Os https://cli.codecov.io/latest/linux/codecov
+         if ! [ -f codecov ]; then
+            echo "FATAL ERROR: cannot download the Codecov CLI"
+            exit 1
+         fi
+      fi
+   fi
+
+   popd
+   chmod +x "$BUILD/tmp/codecov"
+
+   # The CLI infers the repo (owner/repo + git host) from the CI environment,
+   # but that detection is unreliable when the git host and CI provider differ
+   # (a GitHub repo built on Azure -> "Repository not found"). Derive both from
+   # the origin remote and pass them explicitly.
+   slug_arg=""
+   git_service=""
+   remote_url="$(git -C "$SRC" remote get-url origin 2>/dev/null || true)"
+   remote_url="${remote_url%.git}"
+   case "$remote_url" in
+      *github.com*)    git_service="github"    ;;
+      *gitlab.com*)    git_service="gitlab"    ;;
+      *bitbucket.org*) git_service="bitbucket" ;;
+   esac
+   slug="$(echo "$remote_url" | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#')"
+
+   if [[ "$git_service" != "" && "$slug" == */* ]]; then
+      slug_arg="-r $slug --git-service $git_service"
+   fi
+
+   echo "NOTE: codecov target -> service='$git_service' slug='$slug'"
+
+   # Upload this build directory's coverage.info. Each build dir (kernel, unit
+   # tests) uploads its own report.
+   #
+   # Run the CLI from the repo root. It builds the "network" of files it maps
+   # coverage onto by walking the working directory, and then opens each of
+   # those files (to compute line fixes) relative to that same directory. Run
+   # from $BUILD the network holds only build artifacts, so CodeCov matches none
+   # of the coverage and the report processes to 0%. (--network-root-folder
+   # alone is NOT enough: it enumerates the source tree, but the CLI still opens
+   # those files relative to the cwd and dies with FileNotFoundError.)
+   (
+      cd "$SRC" && "$BUILD/tmp/codecov" upload-process \
+         --disable-search -f "$BUILD/coverage.info" $token_arg $slug_arg
+   )
+   exit 0
+fi
+
+
+gcda_count=$(find . -name '*.gcda' | wc -l)
+
+if [[ $gcda_count == 0 ]]; then
+   echo "ERROR: no gcda files found in $BUILD"
+   exit 1
+fi
+
+if [[ "$1" != "--acc" ]]; then
+   remove_all_lcov_files
+fi
+
+ex_list=""
+
+# we're not interested in the 3rd-party code in the toolchain
+ex_list="$ex_list '@TCROOT@/*'"
+
+# of course we're not interested in system headers
+ex_list="$ex_list '/usr/include/*'"
+
+# on a Darwin host the unit tests are compiled against the macOS SDK; its
+# libc++ / system headers must not pollute Orion's coverage
+if [[ "$(uname -s)" == "Darwin" ]]; then
+   ex_list="$ex_list '*/MacOSX.sdk/*'"
+fi
+
+# the header is not used anywhere. It's useful only for manual instrumentation
+ex_list="$ex_list '$SRC/include/tilck/common/debug/termios_debug.c.h'"
+
+# syscalls.h contains wrapper funcs for all the Linux syscalls
+ex_list="$ex_list '$SRC/include/tilck/kernel/syscalls.h'"
+
+# the common panic() is not used in Orion
+ex_list="$ex_list '$SRC/common/panic.c'"
+
+# we don't have tests triggering an actual kernel panic
+ex_list="$ex_list '$SRC/common/asserts.c'"
+
+run_command "$LCOV -d . --capture --gcov-tool '$GCOV' -o lcov.info"
+run_command "$LCOV --remove lcov.info $ex_list -o lcov.info"
+
+if [[ "$1" == "--acc" && -f coverage.info ]]; then
+   $LCOV -a coverage.info -a lcov.info -o merged.info
+   mv merged.info coverage.info
+else
+   mv lcov.info coverage.info
+fi
+
+# Remove everything except for our `coverage.info`
+rm -f lcov.info
+remove_gcda_files

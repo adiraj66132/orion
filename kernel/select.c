@@ -1,0 +1,475 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
+#include <tilck_gen_headers/config_userlim.h>
+#include <tilck/common/basic_defs.h>
+
+#include <tilck/kernel/syscalls.h>
+#include <tilck/kernel/user.h>
+#include <tilck/kernel/sched.h>
+#include <tilck/kernel/fs/vfs.h>
+#include <tilck/kernel/timer.h>
+
+struct select_ctx {
+   int nfds;
+   fd_set *sets[3];
+   fd_set *rsets[3];
+   fd_set *u_sets[3];
+   struct k_timeval *tv;
+   struct k_timeval *user_tv;
+   int cond_cnt;
+   u32 timeout_ticks;
+};
+
+static const func_get_rwe_cond gcf[3] = {
+   &vfs_get_rready_cond,
+   &vfs_get_wready_cond,
+   &vfs_get_except_cond
+};
+
+static const func_rwe_ready grf[3] = {
+   &vfs_read_ready,
+   &vfs_write_ready,
+   &vfs_except_ready,
+};
+
+static int
+select_count_cond_per_set(struct select_ctx *c,
+                          fd_set *set,
+                          func_get_rwe_cond gcfunc)
+{
+   if (!set)
+      return 0;
+
+   for (int i = 0; i < c->nfds; i++) {
+
+      if (!FD_ISSET(i, set))
+         continue;
+
+      const fs_handle h = get_fs_handle(i);
+
+      if (!h)
+         return -EBADF;
+
+      if (gcfunc(h))
+         c->cond_cnt++;
+   }
+
+   return 0;
+}
+
+static int
+select_set_kcond(int nfds,
+                 struct multi_obj_waiter *w,
+                 int *idx,
+                 fd_set *set,
+                 func_get_rwe_cond get_cond)
+{
+   fs_handle h;
+   struct kcond *c;
+
+   if (!set)
+      return 0;
+
+   for (int i = 0; i < nfds; i++) {
+
+      if (!FD_ISSET(i, set))
+         continue;
+
+      if (!(h = get_fs_handle(i)))
+         return -EBADF;
+
+      c = get_cond(h);
+
+      if (c) {
+         ASSERT((*idx) < w->count);
+         mobj_waiter_set(w, (*idx)++, WOBJ_KCOND, c, &c->wait_list);
+      }
+   }
+
+   return 0;
+}
+
+static int
+select_eval_ready_set(int nfds,
+                      fd_set *set,
+                      fd_set *out,
+                      func_rwe_ready is_ready)
+{
+   int tot = 0;
+
+   if (!set)
+      return tot;
+
+   FD_ZERO(out);
+
+   for (int i = 0; i < nfds; i++) {
+
+      if (!FD_ISSET(i, set))
+         continue;
+
+      const fs_handle h = get_fs_handle(i);
+
+      if (h && is_ready(h)) {
+         FD_SET(i, out);
+         tot++;
+      }
+   }
+
+   return tot;
+}
+
+/*
+ * Sample the readiness of every watched fd EXACTLY ONCE, recording the
+ * outcome in c->rsets[]. The input sets in c->sets[] are never touched,
+ * so the caller can evaluate again after a sleep.
+ *
+ * Sampling once is what makes the result trustworthy. The *_ready
+ * callbacks can block (pipe_read_ready() takes the pipe's mutex), so
+ * two consecutive passes over the same fds are not atomic with respect
+ * to other tasks and may legitimately disagree.
+ */
+static int
+select_eval_ready(struct select_ctx *c)
+{
+   int count = 0;
+
+   for (int i = 0; i < 3; i++)
+      count += select_eval_ready_set(c->nfds, c->sets[i], c->rsets[i], grf[i]);
+
+   return count;
+}
+
+static int
+select_read_user_sets(fd_set *sets[3],
+                      fd_set *rsets[3],
+                      fd_set *u_sets[3])
+{
+   struct task *curr = get_curr_task();
+
+   for (int i = 0; i < 3; i++) {
+
+      if (!u_sets[i])
+         continue;
+
+      sets[i] = ((fd_set *)curr->args_copybuf) + i;
+      rsets[i] = ((fd_set *)curr->args_copybuf) + 4 + i;
+
+      if (copy_from_user(sets[i], u_sets[i], sizeof(fd_set)))
+         return -EFAULT;
+   }
+
+   return 0;
+}
+
+static int
+select_read_user_tv(struct k_timeval *user_tv,
+                    struct k_timeval **tv_ref,
+                    u32 *timeout)
+{
+   struct k_timeval *tv = NULL;
+   struct task *curr = get_curr_task();
+
+   if (user_tv) {
+
+      u64 tmp = 0;
+
+      tv = (void *) ((fd_set *)curr->args_copybuf + 3);
+
+      if (copy_from_user(tv, user_tv, sizeof(struct k_timeval)))
+         return -EFAULT;
+
+      tmp += (u64)tv->tv_sec * KRN_TIMER_HZ;
+      tmp += (u64)tv->tv_usec / (1000000 / KRN_TIMER_HZ);
+
+      /* NOTE: select() can't sleep for more than UINT32_MAX ticks */
+      *timeout = (u32) CLAMP(tmp, 1u, UINT32_MAX);
+   }
+
+   *tv_ref = tv;
+   return 0;
+}
+
+static int
+select_compute_cond_cnt(struct select_ctx *c)
+{
+   int rc;
+
+   if (!c->tv || c->timeout_ticks > 0) {
+      for (int i = 0; i < 3; i++) {
+         if ((rc = select_count_cond_per_set(c, c->sets[i], gcf[i])))
+            return rc;
+      }
+   }
+
+   return 0;
+}
+
+/* Copy the already-sampled result sets (and the timeout) back to user */
+static int
+select_write_user_sets(struct select_ctx *c)
+{
+   int rc;
+
+   for (int i = 0; i < 3; i++) {
+
+      if (!c->u_sets[i])
+         continue;
+
+      rc = copy_to_user(c->u_sets[i], c->rsets[i], sizeof(fd_set));
+      if (rc)
+         return rc;
+   }
+
+   if (c->tv) {
+      rc = copy_to_user(c->user_tv, c->tv, sizeof(struct k_timeval));
+      if (rc)
+         return rc;
+   }
+
+   return 0;
+}
+
+static int
+select_wait_on_cond(struct select_ctx *c)
+{
+   struct multi_obj_waiter *waiter = NULL;
+   int idx = 0;
+   int rc = 0;
+   struct task *curr = get_curr_task();
+   u64 start_ticks = 0;
+
+   if (!(waiter = allocate_mobj_waiter(c->cond_cnt)))
+      return -ENOMEM;
+
+   for (int i = 0; i < 3; i++) {
+      if ((rc = select_set_kcond(c->nfds, waiter, &idx, c->sets[i], gcf[i])))
+         goto out;
+   }
+
+   if (c->tv)
+      start_ticks = get_ticks();
+
+   while (true) {
+
+      /*
+       * Readiness check with preemption enabled — same reasoning
+       * as poll_wait_on_cond(): *_ready callbacks may block.
+       */
+      rc = select_eval_ready(c);
+
+      if (rc > 0) {
+
+         if (c->tv) {
+
+            const u64 el = get_ticks() - start_ticks;
+            u32 rem = 0;
+
+            if (el < c->timeout_ticks)
+               rem = (u32)(c->timeout_ticks - el);
+
+            c->tv->tv_sec = rem / KRN_TIMER_HZ;
+            c->tv->tv_usec =
+               (rem % KRN_TIMER_HZ) * (1000000 / KRN_TIMER_HZ);
+         }
+
+         break;
+      }
+
+      disable_preemption();
+
+      /* Re-arm signals that fired during the readiness check. */
+      if (mobj_waiter_rearm_signaled(waiter)) {
+         enable_preemption();
+         continue;
+      }
+
+      /*
+       * Arm the timer inside the preempt-disabled section — see
+       * poll_wait_on_cond() for the rationale.
+       */
+      if (c->tv) {
+
+         const u64 elapsed = get_ticks() - start_ticks;
+
+         if (elapsed >= c->timeout_ticks) {
+            c->tv->tv_sec = 0;
+            c->tv->tv_usec = 0;
+            enable_preemption();
+            break;
+         }
+
+         task_set_wakeup_timer(curr, c->timeout_ticks - elapsed);
+      }
+
+      prepare_to_wait_on_multi_obj(waiter);
+      enter_sleep_wait_state();
+      /* enter_sleep_wait_state() leaves preemption enabled */
+
+      if (pending_signals())
+         break;
+
+      if (c->tv && curr->wobj.type) {
+         wait_obj_reset(&curr->wobj);
+         c->tv->tv_sec = 0;
+         c->tv->tv_usec = 0;
+         break;
+      }
+
+      if (c->tv)
+         task_cancel_wakeup_timer(curr);
+
+      disable_preemption();
+      mobj_waiter_rearm_signaled(waiter);
+      enable_preemption();
+   }
+
+   task_cancel_wakeup_timer(curr);
+
+out:
+   free_mobj_waiter(waiter);
+
+   if (pending_signals())
+      return -EINTR;
+
+   return rc;
+}
+
+int sys_select(int user_nfds,
+               fd_set *user_rfds,
+               fd_set *user_wfds,
+               fd_set *user_efds,
+               struct k_timeval *user_tv)
+{
+   struct select_ctx ctx = (struct select_ctx) {
+
+      .nfds = user_nfds,
+      .sets = { 0 },
+      .rsets = { 0 },
+      .u_sets = { user_rfds, user_wfds, user_efds },
+      .tv = NULL,
+      .user_tv = user_tv,
+      .cond_cnt = 0,
+      .timeout_ticks = 0,
+   };
+
+   int rc;
+
+   if (user_nfds < 0 || user_nfds > KRN_MAX_HANDLES)
+      return -EINVAL;
+
+   if ((rc = select_read_user_sets(ctx.sets, ctx.rsets, ctx.u_sets)))
+      return rc;
+
+   if ((rc = select_read_user_tv(user_tv, &ctx.tv, &ctx.timeout_ticks)))
+      return rc;
+
+   rc = select_eval_ready(&ctx);
+
+   if (rc == 0) {
+
+      if ((rc = select_compute_cond_cnt(&ctx)))
+         return rc;
+
+      if (ctx.cond_cnt > 0 && (!user_tv || ctx.timeout_ticks > 0)) {
+
+         /*
+          * The count of condition variables for all the file descriptors is
+          * greater than 0. That's typical.
+          */
+
+         if ((rc = select_wait_on_cond(&ctx)) < 0)
+            return rc;
+
+      } else {
+
+         /*
+          * It is not that difficult cond_cnt to be 0: it's enough the
+          * specified files to NOT have r/w/e get kcond functions. Also, all
+          * the sets might be NULL (see the comment below).
+          */
+
+         if (ctx.timeout_ticks > 0) {
+
+            /*
+             * Corner case: no conditions on which to wait, but timeout is > 0:
+             * this is still a valid case. Many years ago the following call:
+             *    select(0, NULL, NULL, NULL, &tv)
+             * was even used as a portable implementation of nanosleep().
+             */
+
+            kernel_sleep(ctx.timeout_ticks);
+
+            if (pending_signals())
+               return -EINTR;
+         }
+
+         rc = select_eval_ready(&ctx);
+      }
+   }
+
+   {
+      const int wrc = select_write_user_sets(&ctx);
+
+      if (wrc)
+         return wrc;
+   }
+
+   return rc;
+}
+
+long sys_pselect6(int user_nfds,
+                  fd_set *user_rfds,
+                  fd_set *user_wfds,
+                  fd_set *user_efds,
+                  struct k_timespec64 *u_timeout,
+                  sigset_t *u_sig)
+{
+   // TODO: Add full support for pselect6()
+
+   ulong sigmask[K_SIGACTION_MASK_WORDS];
+   struct k_timespec64 k_timeout;
+   long rc;
+   int copy_rc;
+
+   if (copy_from_user(sigmask, u_sig, sizeof(sigmask)))
+      return -EFAULT;
+
+   for (int i = 0; i < K_SIGACTION_MASK_WORDS; i++) {
+
+      if (sigmask[i]) {
+         /* We don't support signal masks here yet. */
+         return -ENOSYS;
+      }
+   }
+
+   if (u_timeout) {
+      if (copy_from_user(&k_timeout, u_timeout, sizeof(* u_timeout)))
+         return -EFAULT;
+
+      k_timeout.tv_nsec = k_timeout.tv_nsec / 1000;
+
+      /* separate var: `rc` below must keep sys_select()'s result */
+      copy_rc = copy_to_user(u_timeout, &k_timeout, sizeof(* u_timeout));
+      if (copy_rc)
+         return copy_rc;
+   }
+
+   rc = sys_select(user_nfds,
+                   user_rfds,
+                   user_wfds,
+                   user_efds,
+                   (struct k_timeval *)u_timeout);
+
+   if (u_timeout) {
+      if (copy_from_user(&k_timeout, u_timeout, sizeof(* u_timeout)))
+         return -EFAULT;
+
+      k_timeout.tv_nsec = k_timeout.tv_nsec * 1000;
+
+      copy_rc = copy_to_user(u_timeout, &k_timeout, sizeof(* u_timeout));
+      if (copy_rc)
+         return copy_rc;
+   }
+
+   return rc;
+}

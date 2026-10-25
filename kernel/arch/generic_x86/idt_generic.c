@@ -1,0 +1,131 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
+#include <tilck/common/basic_defs.h>
+#include <tilck/common/printk.h>
+
+#include <tilck/kernel/hal.h>
+#include <tilck/kernel/interrupts.h>
+#include <tilck/kernel/fault_resumable.h>
+#include <tilck/kernel/process.h>
+
+soft_int_handler_t fault_handlers[32];
+
+const char *x86_exception_names[32] =
+{
+   "Division By Zero",
+   "Debug",
+   "Non Maskable Interrupt",
+   "Breakpoint",
+   "Into Detected Overflow",
+   "Out of Bounds",
+   "Invalid Opcode",
+   "No Coprocessor",
+   "Double Fault",
+   "Coprocessor Segment Overrun",
+   "Bad TSS",
+   "Segment Not Present",
+   "Stack Fault",
+   "General Protection Fault",
+   "Page Fault",
+   "Unknown Interrupt",
+   "Coprocessor Fault",
+   "Alignment Check",
+   "Machine Check",
+
+   "Reserved",
+   "Reserved",
+   "Reserved",
+   "Reserved",
+   "Reserved",
+   "Reserved",
+   "Reserved",
+   "Reserved",
+   "Reserved",
+   "Reserved",
+   "Reserved",
+   "Reserved",
+   "Reserved",
+};
+
+void set_fault_handler(int ex_num, void *ptr)
+{
+   fault_handlers[ex_num] = (soft_int_handler_t) ptr;
+}
+
+void handle_resumable_fault(regs_t *r)
+{
+   struct task *curr = get_curr_task();
+   pop_nested_interrupt(); // the fault
+   set_return_register(curr->fault_resume_regs, 1u << regs_intnum(r));
+   context_switch(curr->fault_resume_regs);
+}
+
+static void fault_in_panic(regs_t *r)
+{
+   const int int_num = r->int_num;
+
+   if (is_fault_resumable(int_num))
+      return handle_resumable_fault(r);
+
+   /*
+    * We might be so unlucky that printk() causes some fault(s) too: therefore,
+    * not even trying to print something on the screen is safe. In order to
+    * avoid generating an endless sequence of page faults in the worst case,
+    * just call printk() in SAFE way here.
+    */
+   fault_resumable_call(
+      ALL_FAULTS_MASK, printk, 5,
+      "FATAL: %s [%d] while in panic state [E: 0x%x, EIP: %p]\n",
+      x86_exception_names[int_num], int_num, r->err_code, regs_get_ip(r));
+
+   /* Halt the CPU forever */
+   while (true) { halt(); }
+}
+
+void handle_fault(regs_t *r)
+{
+   const int int_num = r->int_num;
+   const bool is_page_fault = (int_num == FAULT_PAGE_FAULT);
+
+   ASSERT(is_fault(int_num));
+
+   if (UNLIKELY(in_panic()))
+      return fault_in_panic(r);
+
+   if (LIKELY(is_page_fault)) {
+      const enum cow_result cow = handle_potential_cow(r);
+
+      if (cow == COW_RESOLVED)
+         return;                         /* serviced transparently: retry */
+
+      /*
+       * User-access fast path: a page fault inside copy_{to,from}_user().
+       * Resume in place at the primitive's fixup, reporting -ENOMEM for an
+       * out-of-memory CoW page or -EFAULT (reason left 0) for a bad pointer.
+       */
+      if (user_access_resume_on_fault(r, cow == COW_NO_MEM))
+         return;
+
+      if (cow == COW_NO_MEM)
+         return handle_cow_out_of_mem(r); /* recover / kill / panic */
+   }
+
+   /* An ordinary fault: bad-address page fault, or a non-page-fault */
+   if (is_fault_resumable(int_num)) {
+      get_curr_task()->fault_resume_reason = 0;
+      return handle_resumable_fault(r);
+   }
+
+   if (LIKELY(fault_handlers[int_num] != NULL)) {
+
+      fault_handlers[int_num](r);
+
+   } else {
+
+      panic("Unhandled fault #%i: %s [err: %p] EIP: %p",
+            int_num,
+            x86_exception_names[int_num],
+            r->err_code,
+            regs_get_ip(r));
+   }
+}

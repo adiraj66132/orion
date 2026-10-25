@@ -1,0 +1,94 @@
+version: 2
+jobs:
+
+  debug_build:
+    docker:
+      - image: vvaltchev/tilck_build:v9
+    environment:
+      - TCROOT_PARENT: /tc
+      - GTEST_SHUFFLE: 0
+      - DUMP_COV: 1
+      - REPORT_COV: 1
+      - CMAKE_ARGS: -DEXTRA_TCC=1
+    steps:
+      - checkout
+      - run: ./scripts/build_generators/gcc
+      - run: make -j
+      - run: make -j gtests
+      - run: ./build/gtests
+      - run: ./build/tests/unit/scripts/generate_test_coverage_report
+      - run: ./build/st/run_all_tests -c
+      - run: ./build/scripts/generate_kernel_coverage_report --codecov
+
+  release_build:
+    docker:
+      - image: vvaltchev/tilck_build:v9
+    environment:
+      - TCROOT_PARENT: /tc
+      - GTEST_SHUFFLE: 0
+    steps:
+      - checkout
+      - run: ./scripts/build_generators/gcc_rel
+      - run: make -j
+      - run: make -j gtests
+      - run: ./build/gtests
+      - run: ./build/st/run_all_tests -c
+
+  debug_arch_gtests_build:
+    docker:
+      - image: vvaltchev/tilck_build:v9
+    environment:
+      - TCROOT_PARENT: /tc
+      - RELEASE: 0
+      - GTEST_SHUFFLE: 0
+    steps:
+      - checkout
+      - run: ./scripts/build_generators/gcc_arch_gtests
+      - run: make -j gtests
+      - run: ./build/gtests
+
+  debug_syscc_build:
+    docker:
+      - image: vvaltchev/tilck_build:v9
+    environment:
+      - TCROOT_PARENT: /tc
+      - GTEST_SHUFFLE: 0
+    steps:
+      - checkout
+      - run: ./scripts/build_toolchain -s build_libmusl
+      - run: ./scripts/build_generators/gcc_syscc
+      - run: make -j
+      - run: make -j gtests
+      - run: ./build/st/run_all_tests -c
+
+  debug_clang_build:
+    docker:
+      - image: vvaltchev/tilck_build:v9
+    environment:
+      - TCROOT_PARENT: /tc
+      - GTEST_SHUFFLE: 0
+    steps:
+      - checkout
+      - run: ./scripts/build_generators/clang_wconv
+      - run: make -j
+      - run: make -j gtests
+      - run: ./build/gtests
+      - run: ./build/st/run_all_tests -c
+
+workflows:
+  version: 2
+  debug:
+    jobs:
+      - debug_build
+  release:
+    jobs:
+      - release_build
+  arch_gtests:
+    jobs:
+      - debug_arch_gtests_build
+  syscc:
+    jobs:
+      - debug_syscc_build
+  clang:
+    jobs:
+      - debug_clang_build

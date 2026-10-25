@@ -1,0 +1,452 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: BSD-2-Clause
+
+############################################
+# CONSTANTS
+
+VERSION_REGEX='[0-9]+[.][0-9]+[.][0-9]+([.][0-9]+)*'
+
+if [ -t 1 ]; then
+
+   # We're running on a terminal, so we can use colors
+
+   RED='\033[0;31m'
+   GREEN='\033[0;32m'
+   BROWN='\033[0;33m'
+   BLUE='\033[0;34m'
+   MAGENTA='\033[0;35m'
+   CYAN='\033[0;36m'
+   LGRAY='\033[0;37m'
+   DGRAY='\033[1;37m'
+   LRED='\033[1;31m'
+   LGREEN='\033[1;32m'
+   YELLOW='\033[1;33m'
+   LBLUE='\033[1;34m'
+   LMAGENTA='\033[1;35m'
+   LCYAN='\033[1;36m'
+   WHITE='\033[1;37m'
+   RATTRS='\033[0m'
+
+else
+
+   RED=''
+   GREEN=''
+   BROWN=''
+   BLUE=''
+   MAGENTA=''
+   CYAN=''
+   LGRAY=''
+   DGRAY=''
+   LRED=''
+   LGREEN=''
+   YELLOW=''
+   LBLUE=''
+   LMAGENTA=''
+   LCYAN=''
+   WHITE=''
+   RATTRS=''
+fi
+
+if [ -n "$TRAVIS" ]; then
+
+   if [[ $QUIET != 1 ]]; then
+      echo "CI Detected: TRAVIS"
+   fi
+   export RUNNING_IN_CI=1
+
+elif [ -n "$CIRCLECI" ]; then
+
+   if [[ $QUIET != 1 ]]; then
+      echo "CI Detected: CIRCLE"
+   fi
+
+   export RUNNING_IN_CI=1
+
+elif [ -n "$AZURE_HTTP_USER_AGENT" ]; then
+
+   if [[ $QUIET != 1 ]]; then
+      echo "CI Detected: AZURE PIPELINES"
+   fi
+   export RUNNING_IN_CI=1
+
+elif [ -n "$GITHUB_ACTIONS" ]; then
+
+   if [[ $QUIET != 1 ]]; then
+      echo "CI Detected: GITHUB ACTIONS"
+   fi
+   export RUNNING_IN_CI=1
+
+else
+
+   if [[ $QUIET != 1 ]]; then
+      if [[ "$RUNNING_IN_CI" == "1" ]]; then
+         echo "CI Detected: UNKNOWN"
+      else
+         echo "CI Detected: None [Assuming user machine]"
+      fi
+   fi
+fi
+
+############################################
+# FUNCTIONS
+
+function set_host_arch_variable {
+
+   HOST_ARCH="`uname -m`"
+
+   if [[ "$HOST_ARCH" == "x86_64" ]]; then
+
+      : # Great, that's our DEFAULT host architecture: do nothing
+
+   elif [[ "$HOST_ARCH" == "amd64" ]]; then
+
+      # An alias for x86_64: fix our variable
+      HOST_ARCH="x86_64"
+
+   elif [[ "$HOST_ARCH" == "aarch64" ]]; then
+
+      : # That's OK: no translation necessary.
+
+   elif [[ "$HOST_ARCH" == "arm64" ]]; then
+
+      HOST_ARCH="aarch64"
+
+   else
+
+      echo "ERROR: build host architecture $HOST_ARCH not supported"
+      exit 1
+   fi
+}
+
+
+# $1 version in the format "major.minor.patchlevel"
+# $2 component number to get (1 => major, 2 => minor, 3 => patchlevel)
+function get_version_comp {
+   echo -ne $1 | grep -Eo '[0-9]+' | head -$2 | tail -1
+}
+
+# $1 = program name
+function generic_get_version_str {
+   $1 --version | head -1 | grep -Eo "${VERSION_REGEX}[ ]*$" | head -1
+}
+
+# $1 = command
+function run_command {
+   echo "Running command: $1"
+   eval "$1"
+}
+
+# $1 = command
+# $2 = output file
+function run_command2 {
+   echo "Running command: $1 &> $2"
+   eval "$1 &> $2"
+}
+
+pushd () {
+    command pushd "$@" > /dev/null
+}
+
+popd () {
+    command popd "$@" > /dev/null
+}
+
+function show_work_on_component_msg {
+   echo
+   echo "*** $1 ***"
+   echo
+}
+
+function show_skip_component_msg {
+   echo "NOTE: Skipping $1"
+}
+
+# $1 = program name
+# $2 = min version string
+function show_too_old_and_exit {
+   echo "System's $1 is too old. Version >= $2 is required."
+   exit 1
+}
+
+# $1 = program name
+# $2 = current version string (i.e. "1.2.3")
+# $3 = min version string (i.e. "1.2.3")
+function fail_if_too_old {
+
+   major=$(get_version_comp $2 1)
+   minor=$(get_version_comp $2 2)
+   echo "[cmake_run] $1 version (parsed): $major.$minor"
+
+   min_major=$(get_version_comp $3 1)
+   min_minor=$(get_version_comp $3 2)
+
+   if [[ $major -lt $min_major ||
+         ( $major -eq $min_major && $minor -lt $min_minor ) ]]
+   then
+      show_too_old_and_exit $1 $3
+   fi
+}
+
+# The digest of a file, spelled as other/pkg_hashes spells a pin:
+# sha256:<64 hex>. The tool differs per host: sha256sum on Linux,
+# sha256 on FreeBSD, shasum on Darwin.
+function sha256_of {
+
+   local f="$1"
+
+   if command -v sha256sum &> /dev/null; then
+      echo "sha256:$(sha256sum "$f" | cut -d' ' -f1)"
+   elif command -v sha256 &> /dev/null; then
+      echo "sha256:$(sha256 -q "$f")"
+   else
+      echo "sha256:$(shasum -a 256 "$f" | cut -d' ' -f1)"
+   fi
+}
+
+# The value a `name: value` table holds for a name, or nothing. An
+# exact match on the name: nothing in a cache filename is parsed, and
+# the characters one may have ('+', '.') mean things to a regex.
+function table_value {
+
+   local name="$1"
+   local file="$2"
+
+   [ -f "$file" ] || return 0
+   awk -v n="$name" -F': ' '$1 == n { print $2; exit }' "$file"
+}
+
+# The file out of the way, under cache/rejected, for a person to look
+# at; the next run fetches one in its place.
+function set_aside_cachefile {
+
+   local name="$1"
+
+   local record="$TC/cache/.hashes"
+
+   mkdir -p "$TC/cache/rejected"
+   mv "$TC/cache/$name" "$TC/cache/rejected/$name"
+
+   # ...and out of the record: what is fetched next takes its name.
+   if [ -f "$record" ]; then
+      awk -v n="$name" -F': ' '$1 != n' "$record" > "$record.tmp"
+      mv "$record.tmp" "$record"
+   fi
+
+   echo "WARNING: $name set aside as rejected/$name"
+}
+
+# A file in the cache is what other/pkg_hashes pins it to, and what
+# the cache recorded when it placed it (cache/.hashes), or the
+# bootstrap stops: the same three refusals the package manager makes
+# (scripts/pkgmgr/cache.rb), in the one place a file is fetched
+# before there is a package manager to fetch it. A file that stands
+# and is not yet recorded is recorded.
+function check_cachefile {
+
+   local name="$1"
+   local path="$TC/cache/$name"
+   local pins="$MAIN_DIR/other/pkg_hashes"
+   local record="$TC/cache/.hashes"
+   local pin=$(table_value "$name" "$pins")
+   local recorded=$(table_value "$name" "$record")
+   local digest=$(sha256_of "$path")
+
+   if [[ -n "$recorded" && "$recorded" != "$digest" ]]; then
+      echo "ERROR: $name in the cache is damaged: its bytes are not the" \
+           "ones recorded when it was placed (.hashes)"
+      set_aside_cachefile "$name"
+      exit 1
+   fi
+
+   if [[ -z "$pin" ]]; then
+      echo "ERROR: no pin for $name in other/pkg_hashes"
+      echo "INFO: the file in the cache is:"
+      echo "INFO:    $name: $digest"
+      echo "INFO: add that line to other/pkg_hashes if it is the source" \
+           "you mean, and run again"
+      exit 1
+   fi
+
+   if [[ "$pin" != "$digest" ]]; then
+      echo "ERROR: $name in the cache is not what other/pkg_hashes names"
+      echo "INFO:    pinned: $pin"
+      echo "INFO:    cached: $digest"
+      set_aside_cachefile "$name"
+      exit 1
+   fi
+
+   if [[ -z "$recorded" ]]; then
+      echo "$name: $digest" >> "$record"
+   fi
+}
+
+# One bootstrap at a time per cache file: mkdir is atomic on every
+# host we build on, where flock(1) is Linux's alone. The lock is a
+# directory under cache/.locks holding its owner's pid; one whose
+# owner is gone is taken over. The package manager holds its own
+# locks (scripts/pkgmgr/lock.rb) on files it fetches; the bootstrap
+# fetches only Ruby's, which the package manager never touches.
+function lock_cachefile {
+
+   local name="$1"
+   local dir="$TC/cache/.locks/bash-$name.d"
+   local waited=0
+
+   mkdir -p "$TC/cache/.locks"
+
+   while ! mkdir "$dir" 2> /dev/null; do
+
+      local owner=$(cat "$dir/pid" 2> /dev/null)
+
+      if [[ -n "$owner" ]] && ! kill -0 "$owner" 2> /dev/null; then
+         rm -rf "$dir"
+         continue
+      fi
+
+      if [[ $waited == 0 ]]; then
+         echo "INFO: Waiting for another package manager: $name"
+      fi
+
+      sleep 1
+      waited=$((waited + 1))
+   done
+
+   echo $$ > "$dir/pid"
+}
+
+function unlock_cachefile {
+   rm -rf "$TC/cache/.locks/bash-$1.d"
+}
+
+function download_file_in_cache {
+
+   local url="$1"
+   local remote_file="$2"
+   local local_file="$3"
+
+   if [[ "$local_file" == "" ]]; then
+      local_file="$remote_file"
+   fi
+
+   lock_cachefile "$local_file"
+
+   if ! [ -f $TC/cache/$local_file ]; then
+
+      pushd $TC/cache
+      mkdir -p tmp
+      pushd tmp
+
+      rm -rf *
+      wget "$url/$remote_file"
+
+      if ! [ -f "$remote_file" ]; then
+         echo "ERROR: download of $local_file ($remote_file) failed"
+         exit 1
+      fi
+
+      mv "$remote_file" "../$local_file"
+      popd
+
+      rmdir tmp
+      popd
+
+   else
+
+      if [[ "$remote_file" == "$local_file" ]]; then
+         echo "NOTE: Skipping the download of $local_file"
+      else
+         echo "NOTE: Skipping the download of $local_file ($remote_file)"
+      fi
+   fi
+
+   check_cachefile "$local_file"
+   unlock_cachefile "$local_file"
+}
+
+function extract_cachefile_tar_generic {
+
+   local tarfile="$1"
+   local internalDirName="$2"
+   local newDirName="$3"
+   local tarOpt=""
+
+   if [[ "$tarfile" == *.gz ]]; then
+      tarOpt="xfz"
+   elif [[ "$tarfile" == *.bz2 ]]; then
+      tarOpt="xfj"
+   elif [[ "$tarfile" == *.xz ]]; then
+      tarOpt="xfJ"
+   elif [[ "$tarfile" == *.tgz ]]; then
+      tarOpt="xfz"
+   else
+      echo "ERROR: extension of '$tarfile' not supported!"
+      exit 1
+   fi
+
+   # Checked right before it is read, as the package manager checks
+   # every archive it extracts, and read under the file's lock.
+   lock_cachefile "$tarfile"
+   check_cachefile "$tarfile"
+
+   echo "Extracting $tarfile..."
+   tar $tarOpt $TC/cache/$tarfile
+   unlock_cachefile "$tarfile"
+
+   if ! [ "$internalDirName" = "--" ]; then
+      if ! [ "$internalDirName" = "$newDirName" ]; then
+
+         if ! [ -d "$internalDirName" ]; then
+            echo "ERROR: internal dir: '$internalDirName' not found"
+            exit 1
+         fi
+
+         if [ -d "$newDirName" ]; then
+            if [[ "$( ls -A $newDirName )" != "" ]]; then
+               echo "ERROR: new dir: '$newDirName' exists and it's non-empty"
+               exit 1
+            else
+               rmdir "$newDirName"  # new dir is empty, it's OK to remove
+            fi
+         fi
+
+         mv "$internalDirName" "$newDirName"
+      fi
+   fi
+
+   echo "Extracting completed."
+}
+
+function extract_cachefile_tar_gz {
+   extract_cachefile_tar_generic "$1" "$2" "$3"
+}
+
+function extract_cachefile_tar_bz {
+   extract_cachefile_tar_generic "$1" "$2" "$3"
+}
+
+function extract_cachefile_tar_xz {
+   extract_cachefile_tar_generic "$1" "$2" "$3"
+}
+
+function dump_cross_compiler_env {
+
+   echo "[DEBUG] CC=$CC" >> $1
+   echo "[DEBUG] CXX=$CXX" >> $1
+   echo "[DEBUG] SYS_CC=$SYS_CC" >> $1
+   echo "[DEBUG] SYS_CXX=$SYS_CXX" >> $1
+   echo "[DEBUG] CC_POST_FLAGS=$CC_POST_FLAGS" >> $1
+   echo "[DEBUG] CROSS_COMPILE=$CROSS_COMPILE" >> $1
+   echo "[DEBUG] CFLAGS=$CFLAGS" >> $1
+   echo "[DEBUG] LDFLAGS=$LDFLAGS" >> $1
+   echo "[DEBUG] CPPFLAGS=$CPPFLAGS" >> $1
+
+   for a in i386 i686 x86_64 riscv64 aarch64; do
+      if which ${a}-linux-gcc &> null; then
+         echo "[DEBUG] ${a}-linux-gcc: $(which ${a}-linux-gcc)" >> $1
+      else
+         echo "[DEBUG] ${a}-linux-gcc: " >> $1
+      fi
+   done
+   echo "[DEBUG] PATH: $PATH" >> $1
+}
+

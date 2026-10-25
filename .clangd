@@ -1,0 +1,11 @@
+CompileFlags:
+  BuiltinHeaders: QueryDriver
+  CompilationDatabase: build/compile_db
+  Add:
+    - -Ibuild/tilck_gen_headers
+    - -DCLANGD
+    - -Wno-undefined-internal
+
+  Remove:
+    - -maccumulate-outgoing-args
+    - -Werror

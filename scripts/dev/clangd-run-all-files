@@ -1,0 +1,102 @@
+#!/bin/bash
+
+# Project's root directory
+SOURCE_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+MAIN_DIR="$(realpath "$(cd "$SOURCE_DIR/../.." && pwd)")"
+CMDS=$MAIN_DIR/build/compile_commands.json
+ARCH_LIST=
+
+if ! [ -f $CMDS ]; then
+   echo "ERROR: compile_commands.json not found"
+   exit 1
+fi
+
+if ! [ -f $SOURCE_DIR/clangd-check-single-file ]; then
+   echo "ERROR: clangd-check-single-file not found"
+   exit 1
+fi
+
+if [[ "$1" == "" ]]; then
+   echo "ERROR: missing <allowed arch list> parameters"
+   exit 1
+fi
+
+ARCH_LIST="$*"
+
+cd $MAIN_DIR
+files_list=()
+
+while IFS= read -r file; do
+   files_list+=("$file")
+done < <(fd '\.h$')
+
+while IFS= read -r file; do
+   files_list+=("$file")
+done < <(jq -r '.[].file' $CMDS | grep -E '\.(c|cc|cxx|cpp)$')
+
+
+i=0
+failed=0
+count=${#files_list[@]}
+
+for file in "${files_list[@]}"; do
+
+   rp="$(realpath "$file")"
+
+   if [[ "$rp" == $MAIN_DIR/config/*.h ]]; then
+      # Config files are templates processed by CMake. They contain invalid
+      # directives like #cmakedefine01. Skip.
+      i=$((i+1))
+      continue
+   fi
+
+   if [[ "$rp" == $MAIN_DIR/tests/* ]]; then
+      # Unit test files are not supported, yet.
+      i=$((i+1))
+      continue
+   fi
+
+   if [[ $file == */tfblib/fonts/*.c ]]; then
+      # Font files encoded in C files take a long time to be processed by
+      # clangd, let's skip them.
+      i=$((i+1))
+      continue
+   fi
+
+   r='(kernel\/arch|common\/arch|modules\/[^\/]+)\/([^\/]+)\/.+'
+   if [[ "$file" =~ $r ]]; then
+      file_arch=${BASH_REMATCH[2]}
+      if ! [[ "$ARCH_LIST" == *"$file_arch"* ]]; then
+         echo "[$((i*100/count))%] SKIP: $file [Arch: $file_arch]"
+         i=$((i+1))
+         continue
+      fi
+   fi
+
+   if [[ "$ARCH_LIST" == *riscv* ]]; then
+
+      if [[ "$rp" == *boot/* ||
+            "$rp" == */common/boot.h ||
+            "$rp" == */common/elf_*
+         ]]
+      then
+         echo "[$((i*100/count))%] SKIP: $file [Arch: generic_x86]"
+         i=$((i+1))
+         continue
+      fi
+   fi
+
+   echo "[$((i*100/count))%] FILE: $file"
+   if ! out=$($SOURCE_DIR/clangd-check-single-file $file); then
+      echo "------------------------------------------------------------------"
+      echo "$out"
+      echo "------------------------------------------------------------------"
+      failed=$((failed+1))
+   fi
+   i=$((i+1))
+done
+echo "[100%] DONE"
+
+if [[ $failed -gt 0 ]]; then
+   exit 1
+fi

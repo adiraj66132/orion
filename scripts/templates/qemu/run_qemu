@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+
+BUILD_DIR=@CMAKE_BINARY_DIR@
+MAIN_DIR="@CMAKE_SOURCE_DIR@"
+QEMU_ARCH="@ARCH@"
+source "$MAIN_DIR/scripts/bash_includes/qemu_select"
+qemu_select "$@"
+set -- "${QEMU_ARGS[@]}"
+
+if [ -z "$GDB_PORT" ]; then
+   GDB_PORT=1234
+fi
+
+"$QEMU"                                                \
+   @QEMU_COMMON_OPTS@                                  \
+   -gdb tcp::$GDB_PORT                                 \
+   @QEMU_RAM_OPT@                                      \
+   -drive id=img1,format=raw,if=none,file=@IMG_FILE@   \
+   -netdev user,id=net0,hostfwd=udp::2222-:22          \
+   -device e1000,netdev=net0                           \
+   @QEMU_ARCH_OPTS@ $EXTRA_OPTS "$@"

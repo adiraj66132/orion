@@ -1,0 +1,24 @@
+#
+# Versions of the packages that end up in Orion itself (target side).
+#
+# Host-side tool versions live in other/host_pkg_versions and are
+# completely unrelated: ncurses appears in both files and the two
+# versions may differ freely.
+#
+VER_ACPICA=R2024_12_12
+VER_BUSYBOX=1.36.1
+VER_ZLIB=v1.2.11
+VER_DTC=1.7.0
+VER_MICROPYTHON=v1.26.0
+VER_GNUEFI=3.0.17
+VER_FBDOOM=0.12.1
+VER_FREEDOOM=0.12.1
+VER_MUSL=1.2.5
+VER_NCURSES=6.5
+VER_LUA=5.4.1
+VER_TREECMD=1.8.0
+VER_VIM=v8.2.5056
+VER_TCC=98765e5ebc04ea4641
+VER_LICHEERV_NANO_BOOT=20240726
+VER_UBOOT=2024.04
+VER_TFBLIB=dbcefc6

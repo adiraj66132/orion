@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+
+BUILD_DIR="@CMAKE_BINARY_DIR@"
+MAIN_DIR="@CMAKE_SOURCE_DIR@"
+QEMU_ARCH="x86_64"
+source "$MAIN_DIR/scripts/bash_includes/qemu_select"
+qemu_select "$@"
+set -- "${QEMU_ARGS[@]}"
+MY_OVMF_VARS="$BUILD_DIR/ovmf-vars.fd"
+OS="$(uname -s)"
+
+f="@IMG_FILE@"
+tc="@TCROOT@"
+
+if [[ "$OS" == "FreeBSD" ]]; then
+   : ${OVMF_CODE:="/usr/local/share/qemu/edk2-x86_64-code.fd"}
+else
+   : ${OVMF_CODE:="/usr/share/OVMF/OVMF_CODE.fd"}
+   : ${OVMF_VARS:="/usr/share/OVMF/OVMF_VARS.fd"}
+fi
+
+if ! [ -f "$OVMF_CODE" ]; then
+   echo "ERROR: OVMF code not found at $OVMF_CODE"
+   exit 1
+fi
+
+if [[ "$OVMF_VARS" != "" ]]; then
+   if ! [ -f "$OVMF_VARS" ]; then
+      echo "ERROR: OVMF vars not found at $OVMF_VARS"
+      exit 1
+   fi
+   if ! [ -f "$MY_OVMF_VARS" ]; then
+      cp "$OVMF_VARS" "$MY_OVMF_VARS"
+   fi
+   OVMF_VARS_PARAM="-drive if=pflash,format=raw,unit=1,file=$MY_OVMF_VARS"
+fi
+
+if [ -z "$GDB_PORT" ]; then
+   GDB_PORT=1234
+fi
+
+echo "$QEMU"                                             \
+   @QEMU_COMMON_OPTS@                                               \
+   @QEMU_RAM_OPT@                                                   \
+   -gdb tcp::$GDB_PORT                                              \
+   -drive if=pflash,format=raw,unit=0,readonly=on,file=$OVMF_CODE   \
+   $OVMF_VARS_PARAM                                                 \
+   -drive if=none,id=hd0,format=raw,file=$f                         \
+   -device ide-hd,drive=hd0,bootindex=1 "$@"
+
+"$QEMU"                                                             \
+   @QEMU_COMMON_OPTS@                                               \
+   @QEMU_RAM_OPT@                                                   \
+   -gdb tcp::$GDB_PORT                                              \
+   -drive if=pflash,format=raw,unit=0,readonly=on,file=$OVMF_CODE   \
+   $OVMF_VARS_PARAM                                                 \
+   -drive if=none,id=hd0,format=raw,file=$f                         \
+   -device ide-hd,drive=hd0,bootindex=1 "$@"

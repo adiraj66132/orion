@@ -1,0 +1,192 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
+#include <cstdio>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <cassert>
+#include <iostream>
+#include <vector>
+#include <unordered_map>
+#include <unordered_set>
+#include <random>
+
+using namespace std;
+
+extern "C" {
+
+#include <tilck/common/utils.h>
+
+#include <tilck/kernel/system_mmap.h>
+#include <tilck/kernel/kmalloc.h>
+#include <tilck/kernel/paging.h>
+#include <tilck/kernel/kmalloc.h>
+#include <kernel/kmalloc/kmalloc_heap_struct.h> // kmalloc private header
+#include <kernel/kmalloc/kmalloc_block_node.h>  // kmalloc private header
+#include <tilck/kernel/test/mem_regions.h>
+#include <tilck/kernel/test/kmalloc.h>
+
+extern bool suppress_printk;
+
+void *base_va = nullptr;
+static unordered_map<ulong, ulong> mappings;
+
+void initialize_test_kernel_heap()
+{
+   const ulong test_mem_size = 256 * MB;
+
+   if (base_va != nullptr) {
+      bzero(base_va, test_mem_size);
+      mappings.clear();
+      return;
+   }
+
+   base_va = aligned_alloc(MB, test_mem_size);
+   bzero(base_va, test_mem_size);
+
+   mem_regions_count = 1;
+   mem_regions[0] = (struct mem_region) {
+      .addr = 0,
+      .len = test_mem_size,
+      .type = MULTIBOOT_MEMORY_AVAILABLE,
+      .extra = 0,
+   };
+}
+
+void init_kmalloc_for_tests()
+{
+   bzero(&kmalloc_initialized, sizeof(kmalloc_initialized));
+   bzero((void *)&first_heap_struct, sizeof(first_heap_struct));
+   bzero(&heaps, sizeof(heaps));
+   bzero(&used_heaps, sizeof(used_heaps));
+   bzero(&max_tot_heap_mem_free, sizeof(max_tot_heap_mem_free));
+
+   initialize_test_kernel_heap();
+   suppress_printk = true;
+   early_init_kmalloc();
+   init_kmalloc();
+   suppress_printk = false;
+}
+
+int map_page(pdir_t *, void *vaddr, ulong paddr, u32 pg_flags)
+{
+   ASSERT(!((ulong)vaddr & OFFSET_IN_PAGE_MASK)); // check page-aligned
+   ASSERT(!(paddr & OFFSET_IN_PAGE_MASK)); // check page-aligned
+
+   mappings[(ulong)vaddr] = paddr;
+   return 0;
+}
+
+size_t
+map_pages(pdir_t *pdir,
+          void *vaddr,
+          ulong paddr,
+          size_t page_count,
+          u32 pg_flags)
+{
+   for (size_t i = 0; i < page_count; i++) {
+      int rc = map_page(pdir,
+                        (char *)vaddr + (i << PAGE_SHIFT),
+                        paddr + (i << PAGE_SHIFT),
+                        0);
+      VERIFY(rc == 0);
+   }
+
+   return page_count;
+}
+
+void unmap_page(pdir_t *, void *vaddrp, bool free_pageframe)
+{
+   mappings[(ulong)vaddrp] = INVALID_PADDR;
+}
+
+int unmap_page_permissive(pdir_t *, void *vaddrp, bool free_pageframe)
+{
+   unmap_page(nullptr, vaddrp, free_pageframe);
+   return 0;
+}
+
+void
+unmap_pages(pdir_t *pdir,
+            void *vaddr,
+            size_t count,
+            bool do_free)
+{
+   for (size_t i = 0; i < count; i++) {
+      unmap_page(pdir, (char *)vaddr + (i << PAGE_SHIFT), do_free);
+   }
+}
+
+size_t unmap_pages_permissive(pdir_t *pd, void *va, size_t count, bool do_free)
+{
+   for (size_t i = 0; i < count; i++) {
+      unmap_page_permissive(pd, (char *)va + (i << PAGE_SHIFT), do_free);
+   }
+
+   return count;
+}
+
+bool is_mapped(pdir_t *, void *vaddrp)
+{
+   ulong vaddr = (ulong)vaddrp & PAGE_MASK;
+
+   if (vaddr + PAGE_SIZE < LINEAR_MAPPING_END)
+      return true;
+
+   return mappings.find(vaddr) != mappings.end();
+}
+
+ulong get_mapping(pdir_t *, void *vaddrp)
+{
+   return mappings[(ulong)vaddrp];
+}
+
+int virtual_read(pdir_t *pdir, void *extern_va, void *dest, size_t len)
+{
+   memcpy(dest, extern_va, len);
+   return 0;
+}
+
+int virtual_write(pdir_t *pdir, void *extern_va, void *src, size_t len)
+{
+   memcpy(extern_va, src, len);
+   return 0;
+}
+
+/*
+ * High-virtual-memory reservation. In the real kernel this carves
+ * address space out of a top-of-memory range for the isolated
+ * kernel-stack mapping (see alloc_kernel_isolated_stack in
+ * kernel/process.c). For tests we hand out a page-aligned malloc'd
+ * buffer per call -- map_pages above doesn't dereference the
+ * address, it just records the va->pa mapping by key, so any
+ * unique non-null pointer works.
+ *
+ * Release-side complication: vfree2() in kernel/kmalloc/kmalloc.c
+ * routes ANY freed pointer at or above LINEAR_MAPPING_END through
+ * hi_vmem_release, including kmalloc'd ptrs that happen to land
+ * there (the test heap is 256 MB while LINEAR_MAPPING_SIZE is
+ * 128 MB, so the upper half of the heap matches "high address").
+ * Track our own allocations explicitly and ignore anything else --
+ * those ptrs belong to the kmalloc fake heap and would crash if
+ * passed to free().
+ */
+static std::unordered_set<void *> hi_vmem_owned;
+
+void *hi_vmem_reserve(size_t size)
+{
+   void *p = aligned_alloc(PAGE_SIZE, size);
+   assert(p != nullptr);
+   hi_vmem_owned.insert(p);
+   return p;
+}
+
+void hi_vmem_release(void *ptr, size_t size)
+{
+   if (hi_vmem_owned.erase(ptr))
+      free(ptr);
+   /* else: not our allocation -- vfree2 misroute from a
+    * kmalloc'd high-address ptr. Leak silently. */
+}
+
+} // extern "C"

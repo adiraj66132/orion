@@ -1,0 +1,125 @@
+# SPDX-License-Identifier: BSD-2-Clause
+cmake_minimum_required(VERSION 3.22)
+
+set(EARLY_BOOT_SCRIPT ${CMAKE_BINARY_DIR}/boot/legacy/early_boot_script.ld)
+set(STAGE3_SCRIPT ${CMAKE_BINARY_DIR}/boot/legacy/stage3/linker_script.ld)
+set(KERNEL_SCRIPT ${CMAKE_BINARY_DIR}/kernel/arch/${ARCH}/linker_script.ld)
+
+math(EXPR BL_BASE_ADDR
+     "${BL_ST2_DATA_SEG} * 16 + ${EARLY_BOOT_SZ} + ${STAGE3_ENTRY_OFF}"
+     OUTPUT_FORMAT HEXADECIMAL)
+
+file(GLOB config_glob ${GLOB_CONF_DEP} "${CMAKE_SOURCE_DIR}/config/*.h")
+
+foreach(config_path ${config_glob})
+
+   get_filename_component(config_name ${config_path} NAME_WE)
+
+   smart_config_file(
+      ${config_path}
+      ${CMAKE_BINARY_DIR}/tilck_gen_headers/${config_name}.h
+   )
+
+endforeach()
+
+smart_config_file(
+   ${CMAKE_SOURCE_DIR}/config/config_init.h
+   ${CMAKE_BINARY_DIR}/tilck_gen_headers/config_init.h
+)
+
+smart_config_file(
+   ${CMAKE_SOURCE_DIR}/boot/legacy/early_boot_script.ld
+   ${EARLY_BOOT_SCRIPT}
+)
+
+smart_config_file(
+   ${CMAKE_SOURCE_DIR}/kernel/arch/${ARCH}/linker_script.ld
+   ${KERNEL_SCRIPT}
+)
+
+smart_config_file(
+   ${CMAKE_SOURCE_DIR}/tests/runners/single_test_run
+   ${CMAKE_BINARY_DIR}/st/single_test_run
+)
+
+smart_config_file(
+   ${CMAKE_SOURCE_DIR}/tests/runners/run_all_tests
+   ${CMAKE_BINARY_DIR}/st/run_all_tests
+)
+
+smart_config_file(
+   ${CMAKE_SOURCE_DIR}/tests/runners/run_interactive_test
+   ${CMAKE_BINARY_DIR}/st/run_interactive_test
+)
+
+smart_config_file(
+   ${CMAKE_SOURCE_DIR}/tests/runners/run_unit_test
+   ${CMAKE_BINARY_DIR}/st/run_unit_test
+)
+
+smart_config_file(
+   ${CMAKE_SOURCE_DIR}/other/cmake/config_fatpart
+   ${CMAKE_BINARY_DIR}/config_fatpart
+)
+
+smart_config_file(
+   ${CMAKE_SOURCE_DIR}/other/orion_unstripped-gdb.py
+   ${CMAKE_BINARY_DIR}/orion_unstripped-gdb.py
+)
+
+if (APPLE)
+   smart_config_file(
+      ${CMAKE_SOURCE_DIR}/scripts/templates/weaken_syms_macos
+      ${CMAKE_BINARY_DIR}/scripts/weaken_syms
+   )
+else()
+   smart_config_file(
+      ${CMAKE_SOURCE_DIR}/scripts/templates/weaken_syms
+      ${CMAKE_BINARY_DIR}/scripts/weaken_syms
+   )
+endif()
+
+if (${BOOTLOADER_U_BOOT})
+   smart_config_file(
+      ${BOARD_BSP}/fit-image.its
+      ${CMAKE_BINARY_DIR}/boot/u_boot/fit-image.its
+   )
+
+   smart_config_file(
+      ${BOARD_BSP}/u-boot.cmd
+      ${CMAKE_BINARY_DIR}/boot/u_boot/u-boot.cmd
+   )
+
+   smart_config_file(
+      ${BOARD_BSP}/uEnv.txt
+      ${CMAKE_BINARY_DIR}/boot/u_boot/uEnv.txt
+   )
+endif()
+
+# Run qemu scripts
+
+list(
+   APPEND run_qemu_files
+
+   run_qemu
+   debug_run_qemu
+)
+
+if (${ARCH_FAMILY} STREQUAL "generic_x86")
+
+   if (${ARCH} STREQUAL "i386")
+      list(APPEND run_qemu_files run_efi_qemu32)
+   endif()
+
+   list(APPEND run_qemu_files run_multiboot_qemu run_efi_qemu64)
+
+endif()
+
+foreach(script_file ${run_qemu_files})
+   smart_config_file(
+      ${CMAKE_SOURCE_DIR}/scripts/templates/qemu/${script_file}
+      ${CMAKE_BINARY_DIR}/${script_file}
+   )
+endforeach()
+
+include_directories(${CMAKE_BINARY_DIR})

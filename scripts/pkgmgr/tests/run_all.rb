@@ -1,0 +1,561 @@
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Test runner for the Ruby package manager.
+#
+# Usage:
+#   ruby scripts/pkgmgr/tests/run_all.rb [OPTIONS]
+#
+# Options:
+#   --coverage            Collect code coverage + HTML report
+#   --filter REGEX        Run only tests whose name matches REGEX
+#   --verbose-tests       Show stdout/stderr even for passing tests
+#   --system-tests        After unit tests: install all pkgs, build all archs
+#   --all-build-types     With --system-tests: run all build generator configs
+#   --run-also-orion-tests  With --system-tests: run gtests + system tests
+#   --test-arch ARCH|ALL  With --system-tests: the arch(es) to build for
+#   --test-board B|ALL    With --system-tests: the board(s) of each arch
+#   --fail-fast           Stop at the first failure
+#
+# MUTATION_RUN=1 in the environment is how the mutation driver runs
+# this: the run judges a mutant, which is dead at its first failure,
+# so it stops there; the sampled lane -- the quickest killer -- runs
+# before everything else; and the source audits (SourceAudit in
+# test_helper.rb), which no operator can fail, are left out.
+#
+
+# --- Parse runner options before minitest loads ---
+
+$coverage_enabled    = ARGV.delete("--coverage")
+$verbose_tests       = ARGV.delete("--verbose-tests")
+$dry_run             = ARGV.delete("--dry-run")
+$system_tests        = ARGV.delete("--system-tests")
+$all_build_types     = ARGV.delete("--all-build-types")
+$run_orion_tests     = ARGV.delete("--run-also-orion-tests")
+$exhaustive          = ARGV.delete("--exhaustive")
+$mutation            = ARGV.delete("--mutation")
+$judging             = !ENV["MUTATION_RUN"].to_s.empty?
+$fail_fast           = ARGV.delete("--fail-fast") || $judging
+
+# A trace is for reading after a kill, and a kill takes the buffer
+# with it: unbuffered, or the last lines -- the ones that matter --
+# are the ones lost.
+$stdout.sync = true if ENV["PKGMGR_TRACE"]
+
+# PKGMGR_WATCHDOG=N: after N seconds, and every ten thereafter, the
+# main thread's stack goes to the process's own stderr -- not $stderr,
+# which a test in progress has swapped for a buffer nobody reads. The
+# mutation driver sets it just under its budget, so a suite killed at
+# the budget has already said where it was. A thread rather than a
+# signal: a main thread blocked in a subprocess wait answers no signal
+# until the wait ends, and never ending is the case that matters.
+if (budget = ENV["PKGMGR_WATCHDOG"].to_i) > 0
+  Thread.new {
+    sleep budget
+    loop {
+      STDERR.puts "=== watchdog: #{budget}s; the main thread is in:"
+      stack = Thread.main.backtrace.to_a.first(30)
+      STDERR.puts stack.map { |l| "    #{l}" }
+      STDERR.flush
+      sleep 10
+    }
+  }
+end
+$test_filter         = nil
+$test_arch           = nil
+$test_board          = nil
+$test_packages_filter = nil
+
+if (idx = ARGV.index("--filter"))
+  ARGV.delete_at(idx)
+  $test_filter = ARGV.delete_at(idx)
+end
+
+if (idx = ARGV.index("--test-arch"))
+  ARGV.delete_at(idx)
+  $test_arch = ARGV.delete_at(idx)
+end
+
+if (idx = ARGV.index("--test-board"))
+  ARGV.delete_at(idx)
+  $test_board = ARGV.delete_at(idx)
+end
+
+if (idx = ARGV.index("--test-packages-filter"))
+  ARGV.delete_at(idx)
+  $test_packages_filter = ARGV.delete_at(idx)
+end
+
+# The exhaustive lane's knobs: a sample seed, one case to replay, and
+# how many shapes run at once in the full lane.
+if (idx = ARGV.index("--seed"))
+  ARGV.delete_at(idx)
+  $exhaustive_seed = ARGV.delete_at(idx)
+end
+
+if (idx = ARGV.index("--case"))
+  ARGV.delete_at(idx)
+  $exhaustive_case = ARGV.delete_at(idx)
+end
+
+if (idx = ARGV.index("--jobs"))
+  ARGV.delete_at(idx)
+  $exhaustive_jobs = ARGV.delete_at(idx).to_i
+end
+
+if $coverage_enabled
+  require 'coverage'
+  require 'json'
+  # Branches too: a line counts as covered the first time it runs,
+  # with only one of its two outcomes ever having happened, and that
+  # is exactly where this suite has been missing bugs.
+  Coverage.start(lines: true, branches: true)
+
+  # Tell subprocesses (build_toolchain invocations) to also collect
+  # coverage. Each subprocess writes a JSON file; we merge them all
+  # at the end.
+  $coverage_dir = File.join(__dir__, "..", "..", "..", "coverage_html")
+  ENV["COVERAGE_DIR"] = $coverage_dir
+end
+
+# --- Custom reporter with pretty output ---
+
+require 'minitest'
+require 'etc'
+require 'rbconfig'
+require 'stringio'
+require_relative '../term'
+
+# Global flag set by PrettyReporter after tests complete.
+$unit_tests_passed = false
+
+class PrettyReporter < Minitest::AbstractReporter
+
+  include Term
+
+  STDOUT_PFX = "#{CYAN256}stdout#{RESET}#{DIM}│#{RESET} "
+  STDERR_PFX = "#{YELLOW256}stderr#{RESET}#{DIM}│#{RESET} "
+
+  def initialize
+    super
+    @passes = 0
+    @fails = []
+    @errors = []
+    @skips = []
+    @total_time = 0.0
+    @total_assertions = 0
+    @current_class = nil
+    @abort = false
+  end
+
+  # The column the verdict sits in: the longest test name loaded, and
+  # a margin, so that every [ OK ] lines up whatever the names grow to.
+  def self.name_width
+    @name_width ||= Minitest::Runnable.runnables.flat_map { |k|
+      k.instance_methods(false).grep(/\Atest_/).map(&:length)
+    }.max.to_i + 6
+  end
+
+  def name_width = self.class.name_width
+
+  def start
+    @wall_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    puts HLINE
+    puts "#{BOLD}  Ruby pkgmgr test suite#{RESET}"
+    puts HLINE
+    puts
+  end
+
+  # PKGMGR_TRACE names each test before it runs, so that a suite
+  # killed part-way -- the mutation driver's timeout -- says which
+  # test it was in. Off by default: a line per test that finishes is
+  # noise, and the finishing line says everything the trace would.
+  def prerecord(klass, name)
+    return if @abort
+    if klass.name != @current_class
+      @current_class = klass.name
+      puts "  #{DIM}#{klass.name}#{RESET}"
+    end
+    puts "    #{DIM}-> #{name}#{RESET}" if ENV["PKGMGR_TRACE"]
+  end
+
+  def record(result)
+    @total_time += result.time
+    @total_assertions += result.assertions
+
+    if result.passed?
+      @passes += 1
+      ms = "%.0f" % (result.time * 1000)
+      print "    #{result.name.ljust(name_width)} "
+      puts "#{GREEN256}[ OK ]#{RESET}  #{DIM}#{ms}ms#{RESET}"
+      show_captured(result) if $verbose_tests
+    elsif result.skipped?
+      @skips << result
+      print "    #{result.name.ljust(name_width)} "
+      print "#{YELLOW256}[ SKIP ]#{RESET}"
+      why = skip_reason(result)
+      print "  #{DIM}#{why}#{RESET}" if why
+      puts
+    else
+      if result.failure.is_a?(Minitest::UnexpectedError)
+        @errors << result
+        print "    #{result.name.ljust(name_width)} "
+        puts "#{RED256}[ ERROR ]#{RESET}"
+      else
+        @fails << result
+        print "    #{result.name.ljust(name_width)} "
+        puts "#{RED256}[ FAIL ]#{RESET}"
+      end
+      show_captured(result)
+      show_failure(result)
+
+      @abort = true if $fail_fast
+    end
+  end
+
+  def aborted? = @abort
+
+  def report
+    wall = Process.clock_gettime(Process::CLOCK_MONOTONIC) - @wall_start
+    total = @passes + @fails.length + @errors.length + @skips.length
+
+    puts
+    puts HLINE
+
+    if @fails.empty? && @errors.empty?
+      status = "#{GREEN256}#{BOLD}ALL PASSED#{RESET}"
+    else
+      status = "#{RED256}#{BOLD}FAILED#{RESET}"
+    end
+
+    printf "  %s  %d tests, %d assertions, ", status, total, @total_assertions
+    printf "#{GREEN256}%d passed#{RESET}", @passes
+
+    if !@fails.empty?
+      printf ", #{RED256}%d failed#{RESET}", @fails.length
+    end
+    if !@errors.empty?
+      printf ", #{RED256}%d errors#{RESET}", @errors.length
+    end
+    if !@skips.empty?
+      printf ", #{YELLOW256}%d skipped#{RESET}", @skips.length
+    end
+
+    printf "  #{DIM}(%.2fs)#{RESET}\n", wall
+    puts HLINE
+    show_skips
+    puts
+  end
+
+  def passed?
+    ok = @fails.empty? && @errors.empty?
+    $unit_tests_passed = ok
+    ok
+  end
+
+  private
+
+  # What a skip actually says. Minitest fills in a placeholder when
+  # `skip` is called with no argument, which is no more informative
+  # than the word SKIP itself, so it is dropped rather than echoed.
+  def skip_reason(result)
+    msg = result.failure&.message
+    return nil if msg.nil? || msg.empty?
+    return nil if msg.start_with?("Skipped, no message given")
+    return msg.lines.first.chomp
+  end
+
+  # A skipped test is a check that did NOT run, and a suite that
+  # prints ALL PASSED above a silent skip is claiming more than it
+  # verified. Repeat them under the summary, with their reasons, so
+  # that a CI log shows what went unchecked at the point where
+  # someone reads the result.
+  def show_skips
+    return if @skips.empty?
+
+    puts
+    puts "  #{YELLOW256}#{@skips.length} skipped#{RESET} " \
+         "#{DIM}(checks that did not run)#{RESET}"
+
+    for r in @skips do
+      why = skip_reason(r) || "no reason given"
+      puts "    #{DIM}-#{RESET} #{r.name}: #{DIM}#{why}#{RESET}"
+    end
+  end
+
+  def show_captured(result)
+    key = "#{result.class_name || result.klass}##{result.name}"
+    cap = CaptureOutput::CAPTURED[key]
+    return if !cap
+
+    stdout = cap[:stdout]
+    stderr = cap[:stderr]
+    has_output = (stdout && !stdout.empty?) || (stderr && !stderr.empty?)
+    return if !has_output
+
+    puts "    #{DIM}┌── captured output ──#{RESET}"
+
+    if stdout && !stdout.empty?
+      stdout.each_line { |l| puts "    #{STDOUT_PFX}#{l.chomp}" }
+    end
+    if stderr && !stderr.empty?
+      stderr.each_line { |l| puts "    #{STDERR_PFX}#{l.chomp}" }
+    end
+
+    puts "    #{DIM}└────────────────────#{RESET}"
+  end
+
+  def show_failure(result)
+    msg = result.failure.message
+    loc = result.failure.location
+    puts "    #{DIM}┌── failure ──#{RESET}"
+    puts "    #{DIM}│#{RESET} #{RED256}#{msg.gsub("\n", "\n    #{DIM}│#{RESET} ")}#{RESET}"
+    puts "    #{DIM}│#{RESET} at: #{loc}" if loc
+    puts "    #{DIM}└─────────────#{RESET}"
+  end
+end
+
+# --- Capture stdout/stderr per test ---
+
+module CaptureOutput
+
+  CAPTURED = {}
+
+  def run
+    out = StringIO.new
+    err = StringIO.new
+    old_out, old_err = $stdout, $stderr
+    $stdout, $stderr = out, err
+
+    result = super
+
+    key = "#{self.class}##{self.name}"
+    CAPTURED[key] = { stdout: out.string, stderr: err.string }
+    return result
+
+  ensure
+    $stdout, $stderr = old_out, old_err
+  end
+end
+
+Minitest::Test.prepend(CaptureOutput)
+
+# --fail-fast: minitest takes its list of suites before the first one
+# runs, so clearing the list stops nothing; each test still to come is
+# told not to run once the reporter has seen a failure. The one test
+# is run by Runnable.run_one_method(klass, name, reporter) in minitest
+# 5 and by Runnable.run(klass, name, reporter) in minitest 6, where
+# the two-argument Runnable.run is the whole suite.
+module StopAtTheFirstFailure
+  def aborted?(reporter)
+    reporter.reporters.any? { |r| r.respond_to?(:aborted?) && r.aborted? }
+  end
+
+  def run_one_method(klass, method_name, reporter)
+    return if aborted?(reporter)
+    super
+  end
+
+  def run(*args)
+    return if args.length == 3 && aborted?(args.last)
+    super
+  end
+end
+Minitest::Runnable.singleton_class.prepend(StopAtTheFirstFailure)
+
+# --- Configure minitest ---
+
+module Minitest
+  def self.plugin_pretty_init(options)
+    self.reporter.reporters.clear
+    self.reporter.reporters << PrettyReporter.new
+  end
+end
+Minitest.extensions << "pretty"
+
+# Apply --filter if given.
+if $test_filter
+  ARGV << "-n" << "/#{$test_filter}/"
+end
+
+# --- Load all test files ---
+
+Dir.glob(File.join(__dir__, "test_*.rb")).sort.each { |f| require f }
+
+# --- Judging a mutant: the quickest killer first, the audits not at all ---
+
+if $judging && !$dry_run
+  require_relative 'exhaustive/runner'
+  Minitest::Runnable.runnables.reject! { |k| k.include?(SourceAudit) }
+  Minitest::Runnable.runnables.delete(TestExhaustive)
+
+  seed = ($exhaustive_seed || TestExhaustive::DEFAULT_SEED).to_i
+  problems = Exhaustive.self_test
+  problems += Exhaustive.sample_problems(TestExhaustive::SAMPLE, seed: seed)
+                        .first(3).map(&:to_s) if problems.empty?
+  if !problems.empty?
+    puts "  #{Term::RED256}the sampled lane disagrees (seed #{seed}):" \
+         "#{Term::RESET}"
+    problems.each { |p| puts p }
+    exit 1
+  end
+end
+
+# --- Dry-run: list tests without running, then continue to system tests ---
+
+if $dry_run
+  DRY_TAG = "#{Term::CYAN256}[ DRY ]#{Term::RESET}"
+
+  puts Term::HLINE
+  puts "#{Term::BOLD}  Ruby pkgmgr test suite#{Term::RESET}"
+  puts Term::HLINE
+  puts
+
+  count = 0
+  Minitest::Runnable.runnables.sort_by(&:name).each { |klass|
+    methods = klass.instance_methods(false).grep(/\Atest_/).sort
+    next if methods.empty?
+    puts "  #{Term::DIM}#{klass.name}#{Term::RESET}"
+    methods.each { |m|
+      print "    #{m.to_s.ljust(PrettyReporter.name_width)} "
+      puts DRY_TAG
+      count += 1
+    }
+  }
+
+  puts
+  puts Term::HLINE
+  puts "  #{count} unit tests  #{DRY_TAG}"
+  puts Term::HLINE
+  puts
+
+  # Don't run minitest — clear runnables and mark as passed.
+  Minitest::Runnable.runnables.clear
+  $unit_tests_passed = true
+end
+
+# --- After minitest finishes: system tests + coverage ---
+
+Minitest.after_run {
+
+  # What the laws saw. A suite whose command lines all fell outside
+  # the model's grammar would pass while checking nothing; this line
+  # is how that would be noticed.
+  if defined?(Laws)
+    puts "  #{Term::DIM}laws: #{Laws.checked} command lines judged " \
+         "against the model, #{Laws.unparsed.length} outside its " \
+         "grammar#{Term::RESET}"
+  end
+
+  puts
+
+  # The full enumeration: every shape, every world of at most three
+  # installations, every context, every command line -- one process
+  # per shape. A couple of minutes, which is why it is a flag.
+  if $unit_tests_passed && $exhaustive
+    require_relative 'exhaustive/runner'
+    puts Term::HLINE
+    puts "#{Term::BOLD}  Exhaustive lane#{Term::RESET}"
+    puts Term::HLINE
+    puts
+    ok = Exhaustive.run_all(jobs: $exhaustive_jobs)
+    puts
+    puts ok ? "  #{Term::GREEN256}#{Term::BOLD}EXHAUSTIVE: ALL AGREE" \
+              "#{Term::RESET}"
+            : "  #{Term::RED256}#{Term::BOLD}EXHAUSTIVE: DISAGREEMENTS" \
+              "#{Term::RESET}"
+    puts
+    exit 1 if !ok
+  end
+
+  # Mutation: every site of the logic core made wrong one way, and
+  # the suite run against each until its first failure. Minutes; a
+  # flag.
+  if $unit_tests_passed && $mutation
+    require_relative 'mutation/driver'
+    puts Term::HLINE
+    puts "#{Term::BOLD}  Mutation#{Term::RESET}"
+    puts Term::HLINE
+    puts
+    jobs = $exhaustive_jobs || Etc.nprocessors
+    ok = Mutation.certify(Mutation.all_mutants, jobs: jobs,
+                          ruby: RbConfig.ruby)
+    puts
+    puts ok ? "  #{Term::GREEN256}#{Term::BOLD}MUTATION: NONE SURVIVE" \
+              "#{Term::RESET}"
+            : "  #{Term::RED256}#{Term::BOLD}MUTATION: SURVIVORS OR HANGS" \
+              "#{Term::RESET}"
+    puts
+    exit 1 if !ok
+  end
+
+  if $unit_tests_passed && $system_tests
+    require_relative 'system_tests'
+
+    SystemTests.run(
+      run_orion: $run_orion_tests,
+      all_build_types: !!$all_build_types,
+      arch: $test_arch,
+      board: $test_board,
+      packages_filter: $test_packages_filter
+
+    )
+  end
+
+  if $coverage_enabled
+    require_relative '../coverage_reporter'
+
+    # Merge this process's coverage with any subprocess coverage
+    # files (written by build_toolchain invocations during system
+    # tests). Each subprocess writes coverage_<pid>.json.
+    raw = Coverage.result
+
+    # Coverage.result returns frozen arrays — dup everything so we
+    # can merge subprocess data into it.
+    merged = {}
+    raw.each { |path, data|
+      merged[path] = { lines: data[:lines].dup }
+
+      # Branch data is NOT merged from subprocesses. Its keys are
+      # arrays that JSON can only carry as strings, and the subprocess
+      # runs are system tests -- real installs -- while the branches
+      # worth counting are the ones the unit tests reach. Merging a
+      # stringified half would inflate the number without making it
+      # mean anything.
+      merged[path][:branches] = data[:branches] if data[:branches]
+    }
+
+    Dir.glob(File.join($coverage_dir, "coverage_*.json")).each { |f|
+      begin
+        sub = JSON.parse(File.read(f))
+        sub.each { |path, data|
+          lines = data["lines"]
+          next if !lines
+
+          if merged[path]
+            # Merge: for each line, take the max of both counts.
+            mine = merged[path][:lines]
+            lines.each_with_index { |count, i|
+              next if count.nil?
+              if mine[i].nil?
+                mine[i] = count
+              else
+                mine[i] = [mine[i], count].max
+              end
+            }
+          else
+            merged[path] = { lines: lines }
+          end
+        }
+        File.delete(f)
+      rescue => e
+        $stderr.puts "WARNING: failed to merge #{f}: #{e}"
+      end
+    }
+
+    CoverageReporter.report(merged)
+  end
+
+  if !$unit_tests_passed
+    exit 1
+  end
+}

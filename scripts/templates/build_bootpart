@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: BSD-2-Clause
+
+# Exit on any error
+set -e
+
+maindir="@CMAKE_SOURCE_DIR@"
+bdir="@CMAKE_BINARY_DIR@"
+dest="@CMAKE_BINARY_DIR@/bootpart"
+host_arch_dir_sys="@HOST_DIR_DISTRO@"
+mtools_ver="@HOST_VER_MTOOLS@"
+
+mtoolsdir=$host_arch_dir_sys/mtools/$mtools_ver
+mformat=$mtoolsdir/mformat
+mlabel=$mtoolsdir/mlabel
+mmd=$mtoolsdir/mmd
+mcopy=$mtoolsdir/mcopy
+mdel=$mtoolsdir/mdel
+
+if [ ! -f $dest ]; then
+   # If the 'bootpart' file does not already exist
+   dd status=none if=/dev/zero of=$dest count=@BOOTPART_SZ_SEC@
+fi
+
+$mformat -i $dest -d 1 -c 1 -T @BOOTPART_SZ_SEC@ ::
+$mlabel -i $dest ::BOOT
+
+$mmd -i $dest EFI
+$mmd -i $dest EFI/BOOT
+
+if [ -s "@EFI_x86_64_FILE@" ]; then
+   $mcopy -i $dest "@EFI_x86_64_FILE@" ::/EFI/BOOT/
+fi
+
+if [ -s "@EFI_ia32_FILE@" ]; then
+   $mcopy -i $dest "@EFI_ia32_FILE@" ::/EFI/BOOT/
+fi
+
+if [ -n "@KERNEL_BOOTPART_PATH@" ]; then
+   $mcopy -i $dest @KERNEL_FILE@ ::/@KERNEL_BOOTPART_PATH@
+fi
+
+if [ -n "@IMAGE_FIT@" ]; then
+
+   force_fat32=""
+   spc="@FATPART_CLUSTER_SIZE@"
+
+   if [[ "$spc" == "1" ]]; then
+      force_fat32="-F"
+   fi
+
+   $mformat -i $dest -d 1 $force_fat32 -c $spc -T @INITRD_SZ_SEC@ ::
+   $mlabel -i $dest ::ORION
+   $mcopy -i @CMAKE_BINARY_DIR@/fatpart @IMAGE_FIT@ ::/
+
+fi
+
+if [ -n "@BOOT_SCR@" ]; then
+   $mcopy -i $dest @BOOT_SCR@ ::/
+fi
+
+if [ -n "@BOOT_ENVTXT@" ]; then
+   $mcopy -i $dest @BOOT_ENVTXT@ ::/
+fi
+
+if [ -n "@U_BOOT_BIN@" ]; then
+   $mcopy -i $dest @U_BOOT_BIN@ ::/
+fi
+

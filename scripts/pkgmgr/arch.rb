@@ -1,0 +1,127 @@
+# SPDX-License-Identifier: BSD-2-Clause
+
+require_relative 'version_check'
+require 'etc'
+
+DEFAULT_ARCH = "i386"
+
+Architecture = Struct.new(
+
+  # Type name
+  "Architecture",
+
+  # Const fields
+  :name,                # Orion name
+  :family,              # Family name e.g. generic_x86
+  :elf_name,            # ELF arch name used for various tools
+  :ld_output,           # Output format for linker scripts
+  :efi,                 # UEFI architecture name
+  :gcc_tc,              # Arch name for GCC toolchain
+  # Every arch has at least one board, because the board is part of an
+  # installed package's path: a package built for one board must not
+  # be mistaken for the same package built for another. The x86 ones
+  # have exactly one, "pc", which is the ordinary PC platform.
+  :boards,
+  :default_board,
+
+  # Determined at runtime
+  :min_gcc_ver,
+  :default_gcc_ver,
+  :gcc_ver,
+  :target_dir,
+) do
+
+  # To string conversion
+  def to_s = name
+
+  # Every board Orion builds for on this arch -- none for an arch that
+  # is a cross compiler only so far (aarch64), which has no default
+  # board either.
+  def all_boards = boards || []
+
+  # The package that cross compiles for this arch: gcc.rb registers
+  # one per arch under this name, and everything that needs "the
+  # compiler of an arch" -- the implicit dependency of every target
+  # package, -S and -U, the toolchain lookup -- asks here rather than
+  # spelling the name. A second libc or family for an arch changes
+  # this answer, not five call sites.
+  def cross_cc_pkg = "gcc-#{name}-musl"
+
+
+  # Comparison operator
+  def ==(other)
+    case other
+      when String then ((other == 'ALL') ? true : name == other)
+    else
+      super # Struct's default: same class + member-wise equality
+    end
+  end
+
+  # For hash maps
+  def eql?(other) = (self == other)
+  def hash = name.hash
+end
+
+ALL_ARCHS = [
+  Architecture.new(
+    name: "i386",
+    family: "generic_x86",
+    elf_name: "elf32-i386",
+    ld_output: "elf_i386",
+    efi: "ia32",
+    gcc_tc: "i686",
+    boards: ["pc"],
+    default_board: "pc",
+  ),
+  Architecture.new(
+    name: "x86_64",
+    family: "generic_x86",
+    elf_name: "elf64-x86-64",
+    ld_output: "elf_x86_64",
+    efi: "x86_64",
+    gcc_tc: "x86_64",
+    boards: ["pc"],
+    default_board: "pc",
+  ),
+  Architecture.new(
+    name: "riscv64",
+    family: "riscv",
+    elf_name: "elf64-littleriscv",
+    ld_output: "elf64lriscv",
+    efi: nil,
+    gcc_tc: "riscv64",
+    boards: ["qemu-virt", "licheerv-nano"],
+    default_board: "qemu-virt",
+  ),
+  Architecture.new(
+    name: "aarch64",
+    family: "arm",
+    elf_name: "elf64-littleaarch64",
+    ld_output: "aarch64elf",
+    efi: nil,
+    gcc_tc: "aarch64",
+  ),
+].to_h { |a| [ a.name, a ] }
+
+ALL_HOST_ARCHS = [
+  "x86_64",
+  "aarch64",
+].to_h { |a| [ a, ALL_ARCHS[a] ] }
+
+X86_ARCHS = ALL_ARCHS.select { |_, a| a.family == "generic_x86" }
+
+# Convenience helper for Package arch_list declarations: given one or
+# more arch names, return the corresponding Array of Architecture
+# objects. Unknown names raise ArgumentError so typos show up at load
+# time rather than silently.
+#
+#   arch_list: Archs("i386", "x86_64")
+#
+def Archs(*names)
+  names.map { |n|
+    obj = ALL_ARCHS[n]
+    raise ArgumentError, "Unknown arch: #{n}" if obj.nil?
+    obj
+  }
+end
+
