@@ -8,6 +8,9 @@ Linux. Orion does not need a custom set of applications: it runs mainstream
 Linux programs such as **BusyBox**, **Vim**, **TinyCC**, **MicroPython**, **Lua**,
 and framebuffer applications such as **fbDOOM**.
 
+# Code Diagram 
+<img width="945" height="708" alt="image" src="https://github.com/user-attachments/assets/44ed7899-5f58-481c-93cc-d0cf763c68a7" />
+
 Contents
 ----------------------------------------
 * [Overview](#overview)
